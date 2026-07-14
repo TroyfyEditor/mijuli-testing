@@ -495,6 +495,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
     </div>
 
     <button class="sum-gen-btn" id="btn-edit-sum" onclick="editSummary()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;margin-top:8px">Redaguoti santrauką</button>
+    <button class="sum-gen-btn" id="btn-gen-sum" onclick="retrySummarize()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;margin-top:8px">Generuoti santrauką</button>
     <button class="btn-del" onclick="deleteRec()">Ištrinti įrašą</button>
   </div>
 
@@ -1477,7 +1478,9 @@ function renderSummary(rec){
     ov.className='sum-empty';
     ov.textContent='Santraukos dar nėra.';
   }
+  const trForLang=lang==='lt'?rec.transcript:rec.transcriptEn;
   document.getElementById('btn-edit-sum').style.display=hasSummary?'block':'none';
+  document.getElementById('btn-gen-sum').style.display=(!hasSummary&&!generating&&trForLang)?'block':'none';
 }
 function renderComments(comments){
   const el=document.getElementById('comment-list');
@@ -1537,9 +1540,12 @@ function switchDTab(tab){
     activeTab.style.display=tab==='transcript'?'flex':'block';
   }
 }
+let _langReqSeq=0;
 async function setLang(l){
   lang=l;
+  const myReq=++_langReqSeq; // bump the sequence; only the LATEST click's request is allowed to render/write below
   const s=await db.collection('users').doc(user.uid).collection('recordings').doc(recId).get();
+  if(myReq!==_langReqSeq)return; // a newer language switch happened while this one was fetching — abandon it
   if(!s.exists)return;
   const rec=s.data();
   if(l==='en'){
@@ -1549,12 +1555,14 @@ async function setLang(l){
       document.getElementById('d-tr').textContent='Verčiama…';
       try{
         const translated=await translateToEn(rec.transcript);
+        if(myReq!==_langReqSeq)return; // abandoned mid-translation by a newer click
         if(translated){
           await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update({transcriptEn:translated,updatedAt:new Date().toISOString()});
           rec.transcriptEn=translated;
         }
-      }catch(e){toast('Vertimo klaida: '+e.message);}
+      }catch(e){if(myReq===_langReqSeq)toast('Vertimo klaida: '+e.message);}
     }
+    if(myReq!==_langReqSeq)return;
     // Auto-generate EN summary if not yet
     if(!rec.summaryDataEn&&rec.transcriptEn){
       // Render with a flag that hides generate button
@@ -1566,12 +1574,14 @@ async function setLang(l){
         const ov=document.getElementById('sum-overview');
         if(ov){ov.className='sum-empty';ov.textContent='Generuojama santrauka…';}
         const sd=await generateSummaryData(rec.transcriptEn,'en');
+        if(myReq!==_langReqSeq)return; // abandoned mid-generation by a newer click
         const upd={summaryDataEn:sd,updatedAt:new Date().toISOString()};
         await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
         rec.summaryDataEn=sd;
       }catch(e){console.warn('EN summary failed:',e.message);}
     }
   }
+  if(myReq!==_langReqSeq)return; // final guard — a newer click's render should win, not this stale one
   renderDetail(rec);
 }
 async function getRec(){const s=await db.collection('users').doc(user.uid).collection('recordings').doc(recId).get();return s.exists?s.data():null;}
@@ -1961,6 +1971,14 @@ async function doSummarize(){
     await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
     renderSummary({...rec,...upd});toast('Santrauka paruošta ✓');
   }catch(e){toast('Klaida: '+e.message);}
+}
+async function retrySummarize(){
+  const btn=document.getElementById('btn-gen-sum');
+  if(btn){btn.disabled=true;btn.innerHTML='<span class="spin"></span>Generuojama…';}
+  const ov=document.getElementById('sum-overview');
+  if(ov){ov.className='sum-empty';ov.textContent='Generuojama santrauka…';}
+  await doSummarize();
+  if(btn){btn.disabled=false;btn.textContent='Generuoti santrauką';}
 }
 
 
