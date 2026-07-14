@@ -1322,11 +1322,17 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
       })();
     }catch(e){
       console.warn('LT summary failed:',e);
-      toast('Nepavyko sugeneruoti santraukos: '+e.message);
+      if(isNetworkError(e)){
+        toast('Nėra interneto ryšio — tekstas išsaugotas, santrauką sugeneruosime, kai atsiras ryšys (atidarę įrašą).');
+      }else{
+        toast('Nepavyko sugeneruoti santraukos: '+e.message);
+      }
     }
   }catch(err){
     if(err.message==='Tuščias tekstas'){
       toast('Įraše nėra teksto — panašu, kad nebuvo kalbėta arba girdėti tik foninis garsas.');
+    }else if(isNetworkError(err)){
+      toast('Nėra interneto ryšio — įrašas saugiai išsaugotas šiame įrenginyje. Konvertuokite į tekstą, kai ryšys atsistatys.');
     }else{
       toast('Įrašas išsaugotas, bet konvertavimas nepavyko. Bandykite dar kartą.');
     }
@@ -1334,6 +1340,7 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
   await openDetail(id);
 }
 async function translateToEn(transcript){
+  assertOnline();
   const r=await fetch('https://julija.app.n8n.cloud/webhook/e728594c-8e6e-4d06-b0ee-6fc39213347f',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -1560,7 +1567,10 @@ async function setLang(l){
           await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update({transcriptEn:translated,updatedAt:new Date().toISOString()});
           rec.transcriptEn=translated;
         }
-      }catch(e){if(myReq===_langReqSeq)toast('Vertimo klaida: '+e.message);}
+      }catch(e){
+        if(myReq!==_langReqSeq)return;
+        toast(isNetworkError(e)?'Nėra interneto ryšio — vertimas nepavyko, pabandykite vėl, kai ryšys atsistatys.':'Vertimo klaida: '+e.message);
+      }
     }
     if(myReq!==_langReqSeq)return;
     // Auto-generate EN summary if not yet
@@ -1578,7 +1588,10 @@ async function setLang(l){
         const upd={summaryDataEn:sd,updatedAt:new Date().toISOString()};
         await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
         rec.summaryDataEn=sd;
-      }catch(e){console.warn('EN summary failed:',e.message);}
+      }catch(e){
+        console.warn('EN summary failed:',e.message);
+        if(myReq===_langReqSeq)toast(isNetworkError(e)?'Nėra interneto ryšio — santrauka bus sugeneruota, kai ryšys atsistatys.':'Nepavyko sugeneruoti santraukos: '+e.message);
+      }
     }
   }
   if(myReq!==_langReqSeq)return; // final guard — a newer click's render should win, not this stale one
@@ -1890,10 +1903,12 @@ async function addBookmark(){
 
 // ── API ──
 async function transcribeBlob(blob){
+  assertOnline();
   return new Promise((ok,fail)=>{
     const fr=new FileReader();
     fr.onload=async e=>{
       try{
+        assertOnline();
         const b64=e.target.result.split(',')[1];
         const mtype=blob.type||'audio/webm';
         const r=await fetch('https://julija.app.n8n.cloud/webhook/fd3bd58d-bec2-4faa-a6b2-4a4c82804567',{
@@ -1942,6 +1957,8 @@ async function doTranscribe(){
   }catch(e){
     if(e.message==='Tuščias tekstas'){
       toast('Įraše nėra teksto — panašu, kad nebuvo kalbėta arba girdėti tik foninis garsas.');
+    }else if(isNetworkError(e)){
+      toast('Nėra interneto ryšio — pabandykite dar kartą, kai ryšys atsistatys.');
     }else{
       toast('Klaida: '+e.message);
     }
@@ -1949,6 +1966,7 @@ async function doTranscribe(){
   finally{btn.disabled=false;btn.textContent='Konvertuoti iš naujo';}
 }
 async function generateSummaryData(transcript,l){
+  assertOnline();
   const r=await fetch('https://julija.app.n8n.cloud/webhook/42875f8b-1a9c-41bb-bdec-f91968a8b781',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -1970,7 +1988,10 @@ async function doSummarize(){
     const upd=lang==='lt'?{summaryData:sd,updatedAt:new Date().toISOString()}:{summaryDataEn:sd,updatedAt:new Date().toISOString()};
     await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
     renderSummary({...rec,...upd});toast('Santrauka paruošta ✓');
-  }catch(e){toast('Klaida: '+e.message);}
+  }catch(e){
+    if(isNetworkError(e))toast('Nėra interneto ryšio — pabandykite dar kartą, kai ryšys atsistatys.');
+    else toast('Klaida: '+e.message);
+  }
 }
 async function retrySummarize(){
   const btn=document.getElementById('btn-gen-sum');
@@ -2105,6 +2126,21 @@ function ms2t(ms){const t=Math.floor(ms/1000),h=Math.floor(t/3600),m=Math.floor(
 function pad(n){return String(n).padStart(2,'0');}
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),2600);}
+
+// ── NETWORK STATUS ──
+// Throws a consistent, recognizable error the moment we know there's no connection,
+// instead of waiting for a fetch() to time out with a vague "Failed to fetch".
+function assertOnline(){
+  if(!navigator.onLine)throw new Error('Nėra interneto ryšio');
+}
+// Catches both our own assertOnline() throws and the generic browser error fetch()
+// produces when a request can't reach the network at all (wording varies by browser).
+function isNetworkError(e){
+  const m=(e&&e.message)||'';
+  return !navigator.onLine||/nėra interneto ryšio|failed to fetch|network request failed|load failed/i.test(m);
+}
+window.addEventListener('offline',()=>toast('⚠️ Interneto ryšys dingo — įrašymas veiks toliau, bet transkripcija/santrauka lauks, kol ryšys atsistatys.'));
+window.addEventListener('online',()=>toast('Interneto ryšys atsistatė ✓'));
 
 // ── SERVICE WORKER ──
 if('serviceWorker' in navigator){
