@@ -567,6 +567,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
       <div class="acc-avatar-wrap"><div class="acc-avatar" id="acc-avatar">?</div></div>
       <div class="acc-row acc-row-tap" onclick="editNickname()"><span class="acc-row-l">Slapyvardis</span><span class="acc-row-v" id="s-nick">–</span></div>
       <div class="acc-row"><span class="acc-row-l">El. paštas</span><span class="acc-row-v" id="s-email">–</span></div>
+      <div class="acc-row" id="email-verify-banner" style="display:none">
+        <span class="acc-row-l" style="color:var(--muted)">✉️ El. paštas nepatvirtintas</span>
+        <span class="acc-row-v acc-row-tap" onclick="resendVerificationEmail()" style="color:var(--blue);cursor:pointer">Siųsti dar kartą</span>
+      </div>
     </div>
     <div class="acc-sec">
       <div class="acc-lbl">Išvaizda</div>
@@ -733,7 +737,7 @@ async function doForgotPassword(){
     if(q.empty){setErr('Slapyvardis nerastas.');return;}
     await auth.sendPasswordResetEmail(q.docs[0].data().email);
     setErr('');
-    toast('Slaptažodžio atkūrimo laiškas išsiųstas ✓');
+    toast('Slaptažodžio atkūrimo laiškas išsiųstas ✓ Jei nematysite jo per kelias minutes, patikrinkite ir Šlamšto (Spam) aplanką.',5500);
   }catch(e){
     setErr(translateAuthError(e));
   }
@@ -775,6 +779,9 @@ async function doAuth(){
       if(!e){setErr('Įveskite el. paštą.');btn.disabled=false;btn.textContent='Sukurti paskyrą';return;}
       const cr=await auth.createUserWithEmailAndPassword(e,p);
       await db.collection('users').doc(cr.user.uid).set({nickname:n,email:e,createdAt:new Date().toISOString()});
+      // Best-effort: don't block account creation if sending the verification email fails
+      // (e.g. transient network issue) — the person can always resend it later from Account.
+      try{await cr.user.sendEmailVerification();}catch(err){console.warn('Verification email failed:',err);}
     }else{
       const q=await db.collection('users').where('nickname','==',n).limit(1).get();
       if(q.empty){setErr('Neteisingas slapyvardis arba slaptažodis.');btn.disabled=false;btn.textContent='Prisijungti';return;}
@@ -786,6 +793,15 @@ async function doAuth(){
   }
 }
 function setErr(m){document.getElementById('a-err').textContent=m;}
+async function resendVerificationEmail(){
+  if(!user)return;
+  try{
+    await user.sendEmailVerification();
+    toast('Patvirtinimo laiškas išsiųstas ✓ Jei nematysite jo per kelias minutes, patikrinkite ir Šlamšto (Spam) aplanką.',5500);
+  }catch(e){
+    toast(translateAuthError(e));
+  }
+}
 async function doSignOut(){await auth.signOut();}
 
 function afterLogin(){
@@ -930,6 +946,16 @@ function navTo(tab){
     document.getElementById('s-email').textContent=user?.email||'–';
     document.getElementById('acc-avatar').textContent=(nick||'?').charAt(0).toUpperCase();
     document.getElementById('s-vocab').textContent=vocabulary?(vocabulary.length>28?vocabulary.slice(0,28)+'…':vocabulary):'Nenustatyta';
+    // Firebase caches emailVerified locally, so reload() to get the latest status from the
+    // server — this is how we notice if the person clicked the verification link since we
+    // last checked. Google sign-in accounts are always verified already, so this banner
+    // naturally never shows for them.
+    (async()=>{
+      if(!user)return;
+      try{await user.reload();}catch(e){}
+      const banner=document.getElementById('email-verify-banner');
+      if(banner)banner.style.display=user.emailVerified?'none':'flex';
+    })();
     show('p-account');
   }
   setNavActive(tab);
@@ -2025,13 +2051,24 @@ async function transcribeBlob(blob){
         assertOnline();
         const b64=e.target.result.split(',')[1];
         const mtype=blob.type||'audio/webm';
+        // Diagnostic: log the actual segment size so we can tell whether a failure is
+        // plausibly a payload-size limit (e.g. n8n Cloud's gateway) vs. something else.
+        console.log(`transcribeBlob: segment ${(blob.size/1024/1024).toFixed(2)}MB (base64 ~${(b64.length/1024/1024).toFixed(2)}MB), type=${mtype}`);
         const r=await fetch('https://julija.app.n8n.cloud/webhook/fd3bd58d-bec2-4faa-a6b2-4a4c82804567',{
           method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({audio:b64,mimeType:mtype,vocabulary})
         });
-        const d=await r.json();
-        if(!r.ok)throw new Error(d.error||'Klaida konvertuojant į tekstą');
+        let d;
+        const raw=await r.text();
+        try{d=JSON.parse(raw);}catch(parseErr){
+          // A non-JSON response (e.g. an HTML gateway/proxy error page) means this never
+          // reached our n8n workflow at all — most likely a request size limit or gateway
+          // timeout at the infrastructure level, rejected before the workflow even ran.
+          console.warn(`transcribeBlob: non-JSON response, status ${r.status}:`,raw.slice(0,300));
+          throw new Error(`Serverio klaida (${r.status}) — atsakymas ne JSON formato. Galimai failas per didelis arba užklausa nepasiekė apdorojimo.`);
+        }
+        if(!r.ok)throw new Error((d.error?d.error+' ':'')+`(HTTP ${r.status})`);
         if(!d.text)throw new Error('Tuščias tekstas');
         // Whisper kartais grąžina ne-kalbos garsų žymes skliausteliuose (pvz. "[Birds chirping]",
         // "[Music]") anglų kalba, nepriklausomai nuo nustatytos kalbos — tai modelio artefaktas,
@@ -2231,7 +2268,7 @@ function hideSplash(){
 function ms2t(ms){const t=Math.floor(ms/1000),h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=t%60;return h>0?h+':'+pad(m)+':'+pad(s):pad(m)+':'+pad(s);}
 function pad(n){return String(n).padStart(2,'0');}
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),2600);}
+function toast(msg,ms=2600){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),ms);}
 
 // ── NETWORK STATUS ──
 // Throws a consistent, recognizable error the moment we know there's no connection,
