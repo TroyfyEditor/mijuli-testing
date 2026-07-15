@@ -1364,7 +1364,7 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
     }catch(e){
       console.warn('LT summary failed:',e);
       if(isNetworkError(e)){
-        toast('Nėra interneto ryšio — tekstas išsaugotas, santrauką sugeneruosime, kai atsiras ryšys (atidarę įrašą).');
+        toast(networkErrorPhrase()+' — tekstas išsaugotas, santrauką sugeneruosime, kai atsiras ryšys (atidarę įrašą).');
       }else{
         toast('Nepavyko sugeneruoti santraukos: '+e.message);
       }
@@ -1373,7 +1373,7 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
     if(err.message==='Tuščias tekstas'){
       toast('Įraše nėra teksto — panašu, kad nebuvo kalbėta arba girdėti tik foninis garsas.');
     }else if(isNetworkError(err)){
-      toast('Nėra interneto ryšio — įrašas saugiai išsaugotas šiame įrenginyje. Konvertuokite į tekstą, kai ryšys atsistatys.');
+      toast(networkErrorPhrase()+' — įrašas saugiai išsaugotas šiame įrenginyje. Konvertuokite į tekstą, kai ryšys atsistatys.');
     }else{
       toast('Įrašas išsaugotas, bet konvertavimas nepavyko. Bandykite dar kartą.');
     }
@@ -1620,7 +1620,7 @@ async function setLang(l){
         }
       }catch(e){
         if(myReq!==_langReqSeq)return;
-        toast(isNetworkError(e)?'Nėra interneto ryšio — vertimas nepavyko, pabandykite vėl, kai ryšys atsistatys.':'Vertimo klaida: '+e.message);
+        toast(isNetworkError(e)?networkErrorPhrase()+' — vertimas nepavyko, pabandykite vėl, kai ryšys atsistatys.':'Vertimo klaida: '+e.message);
       }
     }
     if(myReq!==_langReqSeq)return;
@@ -1641,7 +1641,7 @@ async function setLang(l){
         rec.summaryDataEn=sd;
       }catch(e){
         console.warn('EN summary failed:',e.message);
-        if(myReq===_langReqSeq)toast(isNetworkError(e)?'Nėra interneto ryšio — santrauka bus sugeneruota, kai ryšys atsistatys.':'Nepavyko sugeneruoti santraukos: '+e.message);
+        if(myReq===_langReqSeq)toast(isNetworkError(e)?networkErrorPhrase()+' — santrauka bus sugeneruota, kai ryšys atsistatys.':'Nepavyko sugeneruoti santraukos: '+e.message);
       }
     }
   }
@@ -2109,7 +2109,7 @@ async function doTranscribe(){
     if(e.message==='Tuščias tekstas'){
       toast('Įraše nėra teksto — panašu, kad nebuvo kalbėta arba girdėti tik foninis garsas.');
     }else if(isNetworkError(e)){
-      toast('Nėra interneto ryšio — pabandykite dar kartą, kai ryšys atsistatys.');
+      toast(networkErrorPhrase()+' — pabandykite dar kartą, kai ryšys atsistatys.');
     }else{
       toast('Klaida: '+e.message);
     }
@@ -2140,7 +2140,7 @@ async function doSummarize(){
     await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
     renderSummary({...rec,...upd});toast('Santrauka paruošta ✓');
   }catch(e){
-    if(isNetworkError(e))toast('Nėra interneto ryšio — pabandykite dar kartą, kai ryšys atsistatys.');
+    if(isNetworkError(e))toast(networkErrorPhrase()+' — pabandykite dar kartą, kai ryšys atsistatys.');
     else toast('Klaida: '+e.message);
   }
 }
@@ -2278,9 +2278,23 @@ function assertOnline(){
 }
 // Catches both our own assertOnline() throws and the generic browser error fetch()
 // produces when a request can't reach the network at all (wording varies by browser).
+// IMPORTANT: browsers throw this same generic error both when the PERSON's own internet
+// is down, AND when a remote server/gateway is unreachable (DNS failure, TLS handshake
+// failure, the server refusing the connection, a 502/503 from a gateway before any proper
+// HTTP response, etc.) even with a perfectly fine local connection. We can't tell these
+// apart from the error text alone — but navigator.onLine tells us whether the DEVICE
+// thinks it has a network path, which is the best signal we have.
 function isNetworkError(e){
   const m=(e&&e.message)||'';
   return !navigator.onLine||/nėra interneto ryšio|failed to fetch|network request failed|load failed/i.test(m);
+}
+// Builds the right user-facing phrase depending on which of the two cases above applies —
+// so we don't wrongly blame "your internet" when it's actually the remote service (e.g.
+// n8n) that's temporarily down or restarting.
+function networkErrorPhrase(){
+  return navigator.onLine
+    ?'Nepavyko pasiekti serverio — tai greičiausiai laikinas serverio trikdis, ne jūsų interneto ryšio problema'
+    :'Nėra interneto ryšio';
 }
 window.addEventListener('offline',()=>toast('⚠️ Interneto ryšys dingo — įrašymas veiks toliau, bet transkripcija/santrauka lauks, kol ryšys atsistatys.'));
 window.addEventListener('online',()=>toast('Interneto ryšys atsistatė ✓'));
