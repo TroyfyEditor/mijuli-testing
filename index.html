@@ -671,7 +671,7 @@ let mr=null,ms=null,chunks=[],tick=null,rms=0,rstate='idle';
 const SEGMENT_MS=8*60*1000;
 let segments=[],curChunks=[],lastSegStartRms=0;
 let analyser=null,af=null;
-let ael=null,aurl=null,playing=false;
+let ael=null,playing=false;
 let allRecs=[];
 
 // ── AUTH ──
@@ -1238,6 +1238,21 @@ async function trackUsage(minutesDelta,summariesDelta){
 // throws 'Tuščias tekstas' from transcribeBlob() — that's just silence in one part of a
 // long recording, so we skip it rather than failing the whole thing. Any other error
 // (network, server) still propagates so the caller can show a real failure.
+// Retries a single segment's transcription a couple of times before giving up — this
+// smooths over brief, transient connectivity blips (e.g. a phone switching from WiFi to
+// cellular mid-recording) that would otherwise fail the whole long transcription outright.
+async function transcribeBlobWithRetry(blob,maxAttempts=3){
+  let lastErr;
+  for(let i=0;i<maxAttempts;i++){
+    try{return await transcribeBlob(blob);}
+    catch(e){
+      lastErr=e;
+      if(e.message==='Tuščias tekstas')throw e; // not a connectivity issue — no point retrying
+      if(i<maxAttempts-1)await new Promise(r=>setTimeout(r,1500*(i+1)));
+    }
+  }
+  throw lastErr;
+}
 async function transcribeSegments(segmentsBlobs){
   if(segmentsBlobs.length===1)return transcribeBlob(segmentsBlobs[0]);
   const estEl=document.getElementById('tr-estimate');
@@ -1245,7 +1260,7 @@ async function transcribeSegments(segmentsBlobs){
   for(let i=0;i<segmentsBlobs.length;i++){
     if(estEl)estEl.textContent=`Apdorojama dalis ${i+1} iš ${segmentsBlobs.length}…`;
     try{
-      const text=await transcribeBlob(segmentsBlobs[i]);
+      const text=await transcribeBlobWithRetry(segmentsBlobs[i]);
       if(text)parts.push(text);
     }catch(e){
       if(e.message==='Tuščias tekstas')continue;
@@ -1292,7 +1307,7 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
     return;
   }
   recId=id;lang='lt';
-  loadAudioBlob(blob);
+  loadAudioSegments(segmentsBlobs);
   // 2) Now attempt transcription. If it fails, the recording still exists — just show
   //    the error and let the person open it and retry via the "Konvertuoti į tekstą" button.
   try{
@@ -1383,8 +1398,14 @@ async function openDetail(id){
   // Load audio: try IndexedDB first (instant), then fall back to Firebase Storage
   // (covers recordings opened on a different device, or after clearing local data).
   (async()=>{
+    const segCount=cached?.segmentCount;
+    // Prefer the cached per-segment blobs (same device as the recording) for playback —
+    // simply concatenating independent segment files into one Blob isn't reliably
+    // seekable across browsers (each MediaRecorder restart writes its own container
+    // header), so we play segments back-to-back through loadAudioSegments() instead.
+    let segs=(segCount>1)?await idbGetSegments(id).catch(()=>null):null;
     let blob=await idbGetBlob(id).catch(()=>null);
-    if(!blob){
+    if(!blob&&!(segs&&segs.length>1)){
       let audioPath=cached?.audioPath;
       if(!audioPath){
         try{const s=await recPromise;audioPath=s.exists?s.data().audioPath:null;}catch(e){}
@@ -1392,16 +1413,20 @@ async function openDetail(id){
       blob=await downloadAudioFromStorage(id,audioPath);
     }
     if(recId!==id)return;
-    if(blob){
+    if(segs&&segs.length>1){
+      loadAudioSegments(segs);
+    }else if(blob){
       loadAudioBlob(blob);
-      // If a previous sync attempt failed, quietly try again now that the person is
-      // back on this recording — no need to wait for them to notice or take action.
+    }else{
+      document.getElementById('p-time').textContent='Garso įrašo nėra šiame įrenginyje';
+    }
+    // If a previous sync attempt failed, quietly try again now that the person is
+    // back on this recording — no need to wait for them to notice or take action.
+    if(blob){
       try{
         const s=await recPromise;
         if(s.exists&&s.data().audioSyncStatus==='failed')uploadAudioToStorageWithRetry(id,blob);
       }catch(e){}
-    }else{
-      document.getElementById('p-time').textContent='Garso įrašo nėra šiame įrenginyje';
     }
   })();
   recPromise.then(s=>{
@@ -1790,16 +1815,93 @@ async function restoreRecording(id){
 }
 
 // ── PLAYER ──
-function loadAudioURL(url){
-  unloadAudio();aurl=url;ael=new Audio(url);
-  ael.onloadedmetadata=()=>{updP();document.getElementById('p-play').disabled=false;document.getElementById('p-stop').disabled=false;};
+// Long recordings are stored as several independent audio segments (see SEGMENT_MS above).
+// Each is a fully valid standalone file, but simply concatenating them into one Blob is
+// NOT reliably seekable across browsers — most only recognize the FIRST segment's
+// container header/duration, silently cutting playback short (exactly the "įrašas
+// sutrumpėjo" symptom). Instead we keep segments separate and play them back-to-back
+// through a single <audio> element, swapping its source at each boundary, while
+// presenting one continuous timeline (seek bar, timer) to the user.
+let aSegUrls=[],aSegDurations=[],aSegIndex=0,aInitialized=false;
+function loadAudioURL(url){loadAudioSegments([url]);}
+function loadAudioBlob(blob){loadAudioSegments(blob?[blob]:[]);}
+function loadAudioSegments(blobs){
+  unloadAudio();
+  blobs=(blobs||[]).filter(Boolean);
+  if(!blobs.length)return;
+  aSegUrls=blobs.map(b=>typeof b==='string'?b:URL.createObjectURL(b));
+  aSegDurations=new Array(aSegUrls.length).fill(0);
+  aSegIndex=0;aInitialized=false;
+  ael=new Audio(aSegUrls[0]);
   ael.ontimeupdate=updP;
-  ael.onended=()=>{ael.currentTime=0;playing=false;document.getElementById('p-ico').innerHTML='<polygon points="5 3 19 12 5 21 5 3"/>';updP();};
+  ael.onloadedmetadata=()=>{
+    const d=(ael.duration&&isFinite(ael.duration))?ael.duration:0;
+    if(d)aSegDurations[aSegIndex]=d;
+    if(!aInitialized){
+      aInitialized=true;
+      document.getElementById('p-play').disabled=false;
+      document.getElementById('p-stop').disabled=false;
+      if(aSegUrls.length>1)preloadSegmentDurations();
+    }
+    updP();
+  };
+  ael.onended=()=>advanceSegment();
+}
+// Quietly probes each remaining segment's duration up front (throwaway Audio elements)
+// so the seek bar shows the correct TOTAL length immediately, rather than only growing
+// as playback reaches each new segment.
+function preloadSegmentDurations(){
+  const remaining=aSegUrls.length-1;
+  let done=0;
+  for(let i=1;i<aSegUrls.length;i++){
+    const probe=new Audio(aSegUrls[i]);
+    const settle=()=>{done++;if(done===remaining)updP();};
+    probe.onloadedmetadata=()=>{aSegDurations[i]=(probe.duration&&isFinite(probe.duration))?probe.duration:0;settle();};
+    probe.onerror=settle;
+  }
+}
+function advanceSegment(){
+  if(!ael)return;
+  if(aSegIndex<aSegUrls.length-1){
+    const wasPlaying=playing;
+    aSegIndex++;
+    ael.src=aSegUrls[aSegIndex];
+    ael.currentTime=0;
+    if(wasPlaying)ael.play().catch(()=>{});
+  }else{
+    aSegIndex=0;
+    ael.src=aSegUrls[0];
+    ael.currentTime=0;
+    playing=false;
+    document.getElementById('p-ico').innerHTML='<polygon points="5 3 19 12 5 21 5 3"/>';
+  }
+  updP();
+}
+function totalDuration(){return aSegDurations.reduce((a,b)=>a+b,0);}
+function globalTime(){
+  let base=0;
+  for(let i=0;i<aSegIndex;i++)base+=aSegDurations[i];
+  return base+(ael?ael.currentTime:0);
+}
+function seekToGlobal(t){
+  if(!ael||!aSegUrls.length)return;
+  const dur=totalDuration();
+  t=Math.max(0,Math.min(dur,t));
+  let idx=0,acc=0;
+  for(;idx<aSegDurations.length-1;idx++){
+    if(t<acc+aSegDurations[idx])break;
+    acc+=aSegDurations[idx];
+  }
+  const wasPlaying=playing;
+  if(idx!==aSegIndex){aSegIndex=idx;ael.src=aSegUrls[idx];}
+  ael.currentTime=Math.max(0,t-acc);
+  if(wasPlaying)ael.play().catch(()=>{});
+  updP();
 }
 function unloadAudio(){
-  if(ael){ael.pause();ael.src='';ael=null;}
-  if(aurl&&aurl.startsWith('blob:'))URL.revokeObjectURL(aurl);
-  aurl=null;playing=false;
+  if(ael){ael.pause();ael.onended=null;ael.ontimeupdate=null;ael.onloadedmetadata=null;ael.src='';ael=null;}
+  aSegUrls.forEach(u=>{if(u&&u.startsWith('blob:'))URL.revokeObjectURL(u);});
+  aSegUrls=[];aSegDurations=[];aSegIndex=0;aInitialized=false;playing=false;
   const pp=document.getElementById('p-play'),ps=document.getElementById('p-stop'),pt=document.getElementById('p-time'),pf=document.getElementById('p-fill');
   if(pp){pp.disabled=true;const i=document.getElementById('p-ico');if(i)i.innerHTML='<polygon points="5 3 19 12 5 21 5 3"/>';}
   if(ps)ps.disabled=true;
@@ -1808,7 +1910,7 @@ function unloadAudio(){
 }
 function updP(){
   if(!ael)return;
-  const pos=ael.currentTime,dur=ael.duration&&isFinite(ael.duration)?ael.duration:0;
+  const pos=globalTime(),dur=totalDuration();
   document.getElementById('p-time').textContent=ms2t(pos*1000);
   document.getElementById('p-dur').textContent=ms2t(dur*1000);
   document.getElementById('p-fill').style.width=(dur?(pos/dur*100).toFixed(1):0)+'%';
@@ -1818,10 +1920,22 @@ async function pToggle(){
   if(playing){ael.pause();playing=false;document.getElementById('p-ico').innerHTML='<polygon points="5 3 19 12 5 21 5 3"/>';}
   else{await ael.play();playing=true;document.getElementById('p-ico').innerHTML='<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>';}
 }
-function pStop(){if(!ael)return;ael.pause();ael.currentTime=0;playing=false;document.getElementById('p-ico').innerHTML='<polygon points="5 3 19 12 5 21 5 3"/>';updP();}
-function seekP(e){if(!ael||!ael.duration)return;const r=e.currentTarget.getBoundingClientRect();ael.currentTime=(e.clientX-r.left)/r.width*ael.duration;updP();}
-function skipBack(){if(ael)ael.currentTime=Math.max(0,ael.currentTime-5);}
-function skipFwd(){if(ael)ael.currentTime=Math.min(ael.duration||0,ael.currentTime+5);}
+function pStop(){
+  if(!ael)return;
+  ael.pause();
+  if(aSegIndex!==0){aSegIndex=0;ael.src=aSegUrls[0];}
+  ael.currentTime=0;
+  playing=false;
+  document.getElementById('p-ico').innerHTML='<polygon points="5 3 19 12 5 21 5 3"/>';
+  updP();
+}
+function seekP(e){
+  if(!ael||!totalDuration())return;
+  const r=e.currentTarget.getBoundingClientRect();
+  seekToGlobal((e.clientX-r.left)/r.width*totalDuration());
+}
+function skipBack(){if(ael)seekToGlobal(globalTime()-5);}
+function skipFwd(){if(ael)seekToGlobal(globalTime()+5);}
 let highlightMode=false;
 const highlightedWords={}; // recId -> Set of word indices
 async function saveHighlights(rId){
@@ -1948,7 +2062,7 @@ async function doTranscribe(){
       let blob=await idbGetBlob(recId).catch(()=>null);
       if(!blob)blob=await downloadAudioFromStorage(recId,rec.audioPath);
       if(!blob){toast('Garso įrašo nėra šiame įrenginyje.');return;}
-      transcript=await transcribeBlob(blob);
+      transcript=await transcribeBlobWithRetry(blob);
     }
     const upd=lang==='lt'?{transcript,transcriptionStatus:'completed',updatedAt:new Date().toISOString()}:{transcriptEn:transcript,updatedAt:new Date().toISOString()};
     await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
@@ -2092,14 +2206,6 @@ async function idbGetSegments(id){
     const r=d.transaction(AUDIO_STORE,'readonly').objectStore(AUDIO_STORE).get(id+'__segs');
     r.onsuccess=()=>ok(r.result?.blob||null);r.onerror=fail;
   });
-}
-function loadAudioBlob(blob){
-  unloadAudio();
-  const url=URL.createObjectURL(blob);
-  aurl=url;ael=new Audio(url);
-  ael.onloadedmetadata=()=>{updP();document.getElementById('p-play').disabled=false;document.getElementById('p-stop').disabled=false;};
-  ael.ontimeupdate=updP;
-  ael.onended=()=>{ael.currentTime=0;playing=false;document.getElementById('p-ico').innerHTML='<polygon points="5 3 19 12 5 21 5 3"/>';updP();};
 }
 // ── UTILS ──
 // ── SPLASH ──
