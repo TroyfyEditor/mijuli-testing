@@ -1331,7 +1331,7 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
     // instead of silently never getting a cloud copy of a long recording.
     uploadAudioToStorageWithRetry(id,blob);
   }catch(err){
-    toast('Nepavyko išsaugoti įrašo: '+err.message);
+    toast('Nepavyko išsaugoti įrašo: '+(err&&err.message?err.message:'nežinoma klaida'));
     goHome();
     return;
   }
@@ -2180,7 +2180,7 @@ async function getAudioDb(){
     const r=indexedDB.open(AUDIO_DB,1);
     r.onupgradeneeded=e=>e.target.result.createObjectStore(AUDIO_STORE,{keyPath:'id'});
     r.onsuccess=e=>ok(e.target.result);
-    r.onerror=fail;
+    r.onerror=()=>fail(r.error||new Error('Nepavyko atidaryti vietinės saugyklos'));
   });
 }
 // ── CLOUD AUDIO (Firebase Storage) ──
@@ -2228,14 +2228,14 @@ async function idbSaveBlob(id,blob){
   const d=await getAudioDb();
   return new Promise((ok,fail)=>{
     const r=d.transaction(AUDIO_STORE,'readwrite').objectStore(AUDIO_STORE).put({id,blob});
-    r.onsuccess=ok;r.onerror=fail;
+    r.onsuccess=ok;r.onerror=()=>fail(r.error||new Error('Nepavyko išsaugoti garso vietinėje saugykloje'));
   });
 }
 async function idbGetBlob(id){
   const d=await getAudioDb();
   return new Promise((ok,fail)=>{
     const r=d.transaction(AUDIO_STORE,'readonly').objectStore(AUDIO_STORE).get(id);
-    r.onsuccess=()=>ok(r.result?.blob||null);r.onerror=fail;
+    r.onsuccess=()=>ok(r.result?.blob||null);r.onerror=()=>fail(r.error||new Error('Nepavyko nuskaityti garso iš vietinės saugyklos'));
   });
 }
 async function idbDeleteBlob(id){
@@ -2244,7 +2244,7 @@ async function idbDeleteBlob(id){
     const tx=d.transaction(AUDIO_STORE,'readwrite'),store=tx.objectStore(AUDIO_STORE);
     store.delete(id);
     store.delete(id+'__segs'); // clean up cached segments (if any) alongside the combined blob
-    tx.oncomplete=ok;tx.onerror=fail;
+    tx.oncomplete=ok;tx.onerror=()=>fail(tx.error||new Error('Nepavyko ištrinti garso iš vietinės saugyklos'));
   });
 }
 // Per-segment cache (same device only) — lets a long recording's transcription be
@@ -2253,14 +2253,14 @@ async function idbSaveSegments(id,blobs){
   const d=await getAudioDb();
   return new Promise((ok,fail)=>{
     const r=d.transaction(AUDIO_STORE,'readwrite').objectStore(AUDIO_STORE).put({id:id+'__segs',blob:blobs});
-    r.onsuccess=ok;r.onerror=fail;
+    r.onsuccess=ok;r.onerror=()=>fail(r.error||new Error('Nepavyko išsaugoti dalių vietinėje saugykloje'));
   });
 }
 async function idbGetSegments(id){
   const d=await getAudioDb();
   return new Promise((ok,fail)=>{
     const r=d.transaction(AUDIO_STORE,'readonly').objectStore(AUDIO_STORE).get(id+'__segs');
-    r.onsuccess=()=>ok(r.result?.blob||null);r.onerror=fail;
+    r.onsuccess=()=>ok(r.result?.blob||null);r.onerror=()=>fail(r.error||new Error('Nepavyko nuskaityti dalių iš vietinės saugyklos'));
   });
 }
 // ── UTILS ──
