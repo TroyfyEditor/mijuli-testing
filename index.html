@@ -672,7 +672,10 @@ let mr=null,ms=null,chunks=[],tick=null,rms=0,rstate='idle';
 // to a fresh MediaRecorder every SEGMENT_MS. Each segment is a complete, independently
 // valid audio file, which lets long recordings be uploaded/transcribed in reliably-sized
 // pieces instead of one file that can exceed Whisper's 25MB limit or n8n's timeout window.
-const SEGMENT_MS=8*60*1000;
+// Set to 4 min (reduced from 8 min on 2026-07-15) after confirming via n8n execution logs
+// that an 8-min segment's base64 payload was causing the n8n Code node (which does
+// Buffer.from(base64,'base64')) to run out of memory and crash the whole execution.
+const SEGMENT_MS=4*60*1000;
 let segments=[],curChunks=[],lastSegStartRms=0;
 let analyser=null,af=null;
 let ael=null,playing=false;
@@ -2047,6 +2050,13 @@ async function transcribeBlob(blob){
   return new Promise((ok,fail)=>{
     const fr=new FileReader();
     fr.onload=async e=>{
+      // fetch() has no built-in timeout — if the server/network just goes silent (no
+      // response, no error), the browser would otherwise wait indefinitely, leaving the
+      // spinner stuck forever with no feedback. Force a clear failure after a reasonable
+      // wait instead, so the retry logic above can kick in or the person gets a real message.
+      const REQUEST_TIMEOUT_MS=90000;
+      const controller=new AbortController();
+      const timeoutId=setTimeout(()=>controller.abort(),REQUEST_TIMEOUT_MS);
       try{
         assertOnline();
         const b64=e.target.result.split(',')[1];
@@ -2057,8 +2067,10 @@ async function transcribeBlob(blob){
         const r=await fetch('https://julija.app.n8n.cloud/webhook/fd3bd58d-bec2-4faa-a6b2-4a4c82804567',{
           method:'POST',
           headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({audio:b64,mimeType:mtype,vocabulary})
+          body:JSON.stringify({audio:b64,mimeType:mtype,vocabulary}),
+          signal:controller.signal
         });
+        clearTimeout(timeoutId);
         let d;
         const raw=await r.text();
         try{d=JSON.parse(raw);}catch(parseErr){
@@ -2076,7 +2088,14 @@ async function transcribeBlob(blob){
         const cleaned=d.text.replace(/\[[^\]]*\]/g,'').replace(/^=+\s*/,'').replace(/\s{2,}/g,' ').trim();
         if(!cleaned)throw new Error('Tuščias tekstas');
         ok(cleaned);
-      }catch(err){fail(err);}
+      }catch(err){
+        clearTimeout(timeoutId);
+        if(err.name==='AbortError'){
+          fail(new Error('Serveris per ilgai neatsakė (90 sek.) — bandykite dar kartą.'));
+        }else{
+          fail(err);
+        }
+      }
     };
     fr.onerror=()=>fail(new Error('Nepavyko nuskaityti garso įrašo'));
     fr.readAsDataURL(blob);
