@@ -1,4 +1,4 @@
-const CACHE = 'mijuli-v36';
+const CACHE = 'mijuli-v37';
 const ASSETS = [
   '/mijuli-testing/',
   '/mijuli-testing/index.html',

@@ -1115,7 +1115,17 @@ async function toggleRec(){
 }
 function startNewMediaRecorder(){
   curChunks=[];
-  mr=new MediaRecorder(ms);
+  // Ask for a modest audio bitrate — plenty for speech, and it keeps segment files small.
+  // Without this, some phones (observed on an iPhone) encode at ~300 kbps, producing
+  // ~9 MB per 4-minute segment: slow uploads, bloated IndexedDB/Storage usage. At 64 kbps
+  // the same segment is ~2 MB. Browsers that ignore or clamp this value just record at
+  // their own rate, and if a browser rejected the option entirely we fall back to defaults —
+  // recording must never fail because of an optimization.
+  try{
+    mr=new MediaRecorder(ms,{audioBitsPerSecond:64000});
+  }catch(e){
+    mr=new MediaRecorder(ms);
+  }
   mr.ondataavailable=e=>{if(e.data.size>0)curChunks.push(e.data);};
   mr.start(100);
 }
@@ -2045,61 +2055,68 @@ async function addBookmark(){
 }
 
 // ── API ──
+// Sends audio as multipart/form-data (a real binary file upload) instead of the old
+// base64-inside-JSON approach. The base64 path required an n8n Code node to rebuild the
+// binary with Buffer.from() inside its memory-limited JS sandbox — which crashed with
+// "out of memory" on larger segments (confirmed: a ~9MB segment from a high-bitrate
+// iPhone recording killed the whole n8n workspace). With multipart, n8n's webhook
+// receives the file through its internal binary handling (stored on disk, not in the
+// sandbox), the Code node is gone entirely, and memory usage no longer depends on file
+// size. Bonus: no base64 step on the phone either — ~25% less data sent.
+const TRANSCRIBE_WEBHOOK_URL='https://julija.app.n8n.cloud/webhook/b91f4e27-3c6a-4a58-9d2e-64c07a8f15db';
 async function transcribeBlob(blob){
   assertOnline();
-  return new Promise((ok,fail)=>{
-    const fr=new FileReader();
-    fr.onload=async e=>{
-      // fetch() has no built-in timeout — if the server/network just goes silent (no
-      // response, no error), the browser would otherwise wait indefinitely, leaving the
-      // spinner stuck forever with no feedback. Force a clear failure after a reasonable
-      // wait instead, so the retry logic above can kick in or the person gets a real message.
-      const REQUEST_TIMEOUT_MS=90000;
-      const controller=new AbortController();
-      const timeoutId=setTimeout(()=>controller.abort(),REQUEST_TIMEOUT_MS);
-      try{
-        assertOnline();
-        const b64=e.target.result.split(',')[1];
-        const mtype=blob.type||'audio/webm';
-        // Diagnostic: log the actual segment size so we can tell whether a failure is
-        // plausibly a payload-size limit (e.g. n8n Cloud's gateway) vs. something else.
-        console.log(`transcribeBlob: segment ${(blob.size/1024/1024).toFixed(2)}MB (base64 ~${(b64.length/1024/1024).toFixed(2)}MB), type=${mtype}`);
-        const r=await fetch('https://julija.app.n8n.cloud/webhook/fd3bd58d-bec2-4faa-a6b2-4a4c82804567',{
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({audio:b64,mimeType:mtype,vocabulary}),
-          signal:controller.signal
-        });
-        clearTimeout(timeoutId);
-        let d;
-        const raw=await r.text();
-        try{d=JSON.parse(raw);}catch(parseErr){
-          // A non-JSON response (e.g. an HTML gateway/proxy error page) means this never
-          // reached our n8n workflow at all — most likely a request size limit or gateway
-          // timeout at the infrastructure level, rejected before the workflow even ran.
-          console.warn(`transcribeBlob: non-JSON response, status ${r.status}:`,raw.slice(0,300));
-          throw new Error(`Serverio klaida (${r.status}) — atsakymas ne JSON formato. Galimai failas per didelis arba užklausa nepasiekė apdorojimo.`);
-        }
-        if(!r.ok)throw new Error((d.error?d.error+' ':'')+`(HTTP ${r.status})`);
-        if(!d.text)throw new Error('Tuščias tekstas');
-        // Whisper kartais grąžina ne-kalbos garsų žymes skliausteliuose (pvz. "[Birds chirping]",
-        // "[Music]") anglų kalba, nepriklausomai nuo nustatytos kalbos — tai modelio artefaktas,
-        // ne vertimo klaida. Išvalome jas prieš išsaugant tekstą.
-        const cleaned=d.text.replace(/\[[^\]]*\]/g,'').replace(/^=+\s*/,'').replace(/\s{2,}/g,' ').trim();
-        if(!cleaned)throw new Error('Tuščias tekstas');
-        ok(cleaned);
-      }catch(err){
-        clearTimeout(timeoutId);
-        if(err.name==='AbortError'){
-          fail(new Error('Serveris per ilgai neatsakė (90 sek.) — bandykite dar kartą.'));
-        }else{
-          fail(err);
-        }
-      }
-    };
-    fr.onerror=()=>fail(new Error('Nepavyko nuskaityti garso įrašo'));
-    fr.readAsDataURL(blob);
-  });
+  // fetch() has no built-in timeout — if the server/network just goes silent (no
+  // response, no error), the browser would otherwise wait indefinitely, leaving the
+  // spinner stuck forever with no feedback. Force a clear failure after a reasonable
+  // wait instead, so the retry logic above can kick in or the person gets a real message.
+  const REQUEST_TIMEOUT_MS=90000;
+  const controller=new AbortController();
+  const timeoutId=setTimeout(()=>controller.abort(),REQUEST_TIMEOUT_MS);
+  try{
+    const mtype=blob.type||'audio/webm';
+    // Diagnostic: log the actual segment size so we can tell whether a failure is
+    // plausibly a payload-size limit (e.g. n8n Cloud's gateway) vs. something else.
+    console.log(`transcribeBlob: segment ${(blob.size/1024/1024).toFixed(2)}MB, type=${mtype}`);
+    const fd=new FormData();
+    // Field name 'audio' must match the HTTP Request node's inputDataFieldName in the
+    // n8n multipart workflow. The filename extension matters to OpenAI (it uses it to
+    // pick the decoder), so derive it from the blob's real mime type.
+    fd.append('audio',blob,'recording.'+audioExtFor(mtype));
+    fd.append('vocabulary',vocabulary||'');
+    // NOTE: no Content-Type header here on purpose — the browser sets
+    // 'multipart/form-data; boundary=...' itself, and setting it manually would
+    // break the boundary and corrupt the upload.
+    const r=await fetch(TRANSCRIBE_WEBHOOK_URL,{
+      method:'POST',
+      body:fd,
+      signal:controller.signal
+    });
+    clearTimeout(timeoutId);
+    let d;
+    const raw=await r.text();
+    try{d=JSON.parse(raw);}catch(parseErr){
+      // A non-JSON response (e.g. an HTML gateway/proxy error page) means this never
+      // reached our n8n workflow at all — most likely a request size limit or gateway
+      // timeout at the infrastructure level, rejected before the workflow even ran.
+      console.warn(`transcribeBlob: non-JSON response, status ${r.status}:`,raw.slice(0,300));
+      throw new Error(`Serverio klaida (${r.status}) — atsakymas ne JSON formato. Galimai failas per didelis arba užklausa nepasiekė apdorojimo.`);
+    }
+    if(!r.ok)throw new Error((d.error?d.error+' ':'')+`(HTTP ${r.status})`);
+    if(!d.text)throw new Error('Tuščias tekstas');
+    // Whisper kartais grąžina ne-kalbos garsų žymes skliausteliuose (pvz. "[Birds chirping]",
+    // "[Music]") anglų kalba, nepriklausomai nuo nustatytos kalbos — tai modelio artefaktas,
+    // ne vertimo klaida. Išvalome jas prieš išsaugant tekstą.
+    const cleaned=d.text.replace(/\[[^\]]*\]/g,'').replace(/^=+\s*/,'').replace(/\s{2,}/g,' ').trim();
+    if(!cleaned)throw new Error('Tuščias tekstas');
+    return cleaned;
+  }catch(err){
+    clearTimeout(timeoutId);
+    if(err.name==='AbortError'){
+      throw new Error('Serveris per ilgai neatsakė (90 sek.) — bandykite dar kartą.');
+    }
+    throw err;
+  }
 }
 async function doTranscribe(){
   const btn=document.getElementById('btn-tr');
