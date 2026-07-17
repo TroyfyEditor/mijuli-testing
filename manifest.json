@@ -1,6 +1,6 @@
 {
-  "name": "miJuli",
-  "short_name": "miJuli",
+  "name": "miJuli TEST",
+  "short_name": "miJuli TEST",
   "description": "Listen. Transcribe. Summarize.",
   "start_url": "/mijuli-testing/",
   "scope": "/mijuli-testing/",
