@@ -502,6 +502,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
     </div>
 
     <button class="sum-gen-btn" id="btn-edit-sum" onclick="editSummary()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;margin-top:8px">Redaguoti santrauką</button>
+    <button class="sum-gen-btn" id="btn-regen-sum" onclick="regenSummary()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;margin-top:8px">Pergeneruoti santrauką</button>
     <button class="sum-gen-btn" id="btn-gen-sum" onclick="retrySummarize()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;margin-top:8px">Generuoti santrauką</button>
     <button class="btn-del" onclick="deleteRec()">Ištrinti įrašą</button>
   </div>
@@ -668,7 +669,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v40';
+const APP_VERSION='v41';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1710,6 +1711,7 @@ function renderSummary(rec){
   }
   const trForLang=lang==='lt'?rec.transcript:rec.transcriptEn;
   document.getElementById('btn-edit-sum').style.display=hasSummary?'block':'none';
+  document.getElementById('btn-regen-sum').style.display=(hasSummary&&!generating&&trForLang)?'block':'none';
   document.getElementById('btn-gen-sum').style.display=(!hasSummary&&!generating&&trForLang)?'block':'none';
 }
 function renderComments(comments){
@@ -2365,6 +2367,25 @@ async function retrySummarize(){
   if(ov){ov.className='sum-empty';ov.textContent='Generuojama santrauka…';}
   await doSummarize();
   if(btn){btn.disabled=false;btn.textContent='Generuoti santrauką';}
+}
+// Regenerates an EXISTING summary from the transcript (the improved prompt makes old
+// summaries worth refreshing). Asks for confirmation first, because regeneration
+// overwrites any manual edits made via "Redaguoti santrauką". Applies only to the
+// currently open language version (LT or EN) — the other language keeps its summary.
+async function regenSummary(){
+  if(!confirm('Dabartinė santrauka bus pakeista nauja, sugeneruota iš teksto. Ranka darytos pataisos (jei buvo) dings. Tęsti?'))return;
+  const btn=document.getElementById('btn-regen-sum');
+  if(btn){btn.disabled=true;btn.innerHTML='<span class="spin"></span>Generuojama…';}
+  const ov=document.getElementById('sum-overview');
+  if(ov){ov.className='sum-empty';ov.textContent='Generuojama nauja santrauka…';}
+  await doSummarize();
+  // On success doSummarize() already rendered the new summary; on failure it only
+  // showed a toast, which would leave "Generuojama…" stuck on screen — so re-render
+  // from the stored record either way. Success: renders the new summary (harmless
+  // repeat). Failure: restores the old summary, nothing lost.
+  const rec=await getRec();
+  if(rec)renderSummary(rec);
+  if(btn){btn.disabled=false;btn.textContent='Pergeneruoti santrauką';}
 }
 
 
