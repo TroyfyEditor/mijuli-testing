@@ -57,6 +57,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 .auth-wrap{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 28px}
 .auth-logo{font-size:38px;font-weight:700;letter-spacing:-.8px;margin-bottom:6px}
 .auth-tag{font-size:13px;color:var(--muted);margin-bottom:40px}
+.app-version{font-size:10px;color:var(--muted);opacity:.55;text-align:center;letter-spacing:.03em;user-select:none}
+.auth-version{margin-top:28px}
+.acc-version{padding:6px 0 18px}
 .auth-tabs{display:flex;background:var(--surface2);border-radius:12px;padding:3px;width:100%;margin-bottom:24px}
 .atab{flex:1;padding:10px;font-size:14px;font-weight:500;background:none;border:none;color:var(--muted);cursor:pointer;font-family:inherit;border-radius:9px;transition:all .15s}
 .atab.on{background:var(--surface3);color:var(--white)}
@@ -338,6 +341,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
     <div class="auth-err" id="a-err"></div>
     <button class="btn-auth" id="btn-auth-do" onclick="doAuth()">Prisijungti</button>
     <button class="btn-forgot" onclick="doForgotPassword()">Pamiršau slaptažodį</button>
+    <div class="app-version auth-version js-app-version"></div>
   </div>
 </div>
 
@@ -611,6 +615,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
     <div class="acc-sec">
       <button class="btn-del btn-danger" onclick="deleteAccount()">Ištrinti paskyrą</button>
     </div>
+    <div class="app-version acc-version js-app-version"></div>
   </div>
 </div>
 
@@ -656,6 +661,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 <div class="toast" id="toast"></div>
 
 <script>
+// Matoma appo versija. SVARBU: keičiant versiją, keisti DVIEJOSE vietose — čia ir
+// sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
+// rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
+// tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
+const APP_VERSION='v38';
+document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
   authDomain:"mijuli-e9b11.firebaseapp.com",
@@ -1286,7 +1297,7 @@ async function transcribeBlobWithRetry(blob,maxAttempts=3){
     try{return await transcribeBlob(blob);}
     catch(e){
       lastErr=e;
-      if(e.message==='Tuščias tekstas')throw e; // not a connectivity issue — no point retrying
+      if(e.message==='Tuščias tekstas'||e.noRetry)throw e; // not a connectivity issue — no point retrying
       if(i<maxAttempts-1)await new Promise(r=>setTimeout(r,1500*(i+1)));
     }
   }
@@ -1325,7 +1336,14 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
   //    Safari's JSON-parsing quirks, etc.), the recording itself is never lost. The user
   //    lands on its detail page with a "Konvertuoti į tekstą" button ready to retry.
   try{
-    await idbSaveBlob(id,blob);
+    // IndexedDB is a LOCAL CACHE, not the source of truth — so its failure must never
+    // block saving the recording. Some environments (e.g. Safari private windows, low
+    // disk space, storage quota pressure) throw "Error preparing Blob/File data" or
+    // similar; previously that killed the whole save and the recording was lost. Now we
+    // just log it and continue: the record still goes to Firestore and the audio to
+    // Firebase Storage. Playback right now works from the in-memory blobs; next time
+    // this recording is opened, the audio falls back to downloading from Storage.
+    await idbSaveBlob(id,blob).catch(e=>console.warn('Local audio cache (IndexedDB) failed — continuing, cloud copy will be the source:',e));
     // Also cache the individual segments locally (same device only) so a failed/retried
     // transcription can be redone segment-by-segment without needing to re-split anything.
     if(segmentsBlobs.length>1)await idbSaveSegments(id,segmentsBlobs).catch(e=>console.warn('Segment cache failed:',e));
@@ -2078,6 +2096,19 @@ async function transcribeBlob(blob){
     // Diagnostic: log the actual segment size so we can tell whether a failure is
     // plausibly a payload-size limit (e.g. n8n Cloud's gateway) vs. something else.
     console.log(`transcribeBlob: segment ${(blob.size/1024/1024).toFixed(2)}MB, type=${mtype}`);
+    // HARD SIZE GUARD: files above ~5-6 MB have crashed the whole n8n workspace (OOM)
+    // even via the multipart path — the HTTP Request node still loads the file into
+    // memory. Refuse to send anything that big: a clear local error is infinitely
+    // better than taking the shared server down for everyone for up to an hour.
+    // Normal recorded segments at 64 kbps are ~2 MB / 4 min, so this only triggers on
+    // abnormal cases (a device that ignored the bitrate request, or an uploaded file).
+    const MAX_SEGMENT_MB=6;
+    if(blob.size>MAX_SEGMENT_MB*1024*1024){
+      clearTimeout(timeoutId);
+      const err=new Error(`Garso dalis per didelė (${(blob.size/1024/1024).toFixed(1)} MB) — serveris saugiai priima iki ${MAX_SEGMENT_MB} MB. Failas nebuvo siųstas, kad neperkrautų serverio. Pabandykite įrašyti iš naujo šiuo įrenginiu — jei klaida kartojasi, praneškite mums.`);
+      err.noRetry=true; // retrying the exact same too-big blob can never succeed
+      throw err;
+    }
     const fd=new FormData();
     // Field name 'audio' must match the HTTP Request node's inputDataFieldName in the
     // n8n multipart workflow. The filename extension matters to OpenAI (it uses it to
@@ -2102,6 +2133,12 @@ async function transcribeBlob(blob){
       console.warn(`transcribeBlob: non-JSON response, status ${r.status}:`,raw.slice(0,300));
       throw new Error(`Serverio klaida (${r.status}) — atsakymas ne JSON formato. Galimai failas per didelis arba užklausa nepasiekė apdorojimo.`);
     }
+    // A 404 from the n8n webhook URL almost always means the workflow itself is
+    // deactivated on the server (n8n auto-disables workflows after an instance crash,
+    // and a webhook can return 404 even while the editor shows "Published" — toggling
+    // Active OFF→ON re-registers it). That's a server-side condition the person can't
+    // fix from the phone, so say so plainly instead of a bare "HTTP 404".
+    if(r.status===404)throw new Error('Serveris nepriima užklausų (404) — greičiausiai apdorojimo procesas serveryje išjungtas. Tai ne jūsų įrenginio problema; pabandykite vėliau arba praneškite mums. Įrašas saugus — konvertuoti galėsite vėliau.');
     if(!r.ok)throw new Error((d.error?d.error+' ':'')+`(HTTP ${r.status})`);
     if(!d.text)throw new Error('Tuščias tekstas');
     // Whisper kartais grąžina ne-kalbos garsų žymes skliausteliuose (pvz. "[Birds chirping]",
