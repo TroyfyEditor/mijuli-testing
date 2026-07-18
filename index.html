@@ -58,6 +58,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 .auth-logo{font-size:38px;font-weight:700;letter-spacing:-.8px;margin-bottom:6px}
 .auth-tag{font-size:13px;color:var(--muted);margin-bottom:40px}
 .app-version{font-size:10px;color:var(--muted);opacity:.55;letter-spacing:.03em;user-select:none}
+.rec-warn{font-size:12px;color:var(--muted);text-align:center;max-width:300px;margin:12px auto 0;line-height:1.5;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:10px 14px}
 #p-auth{position:relative}
 .auth-version{position:absolute;bottom:14px;right:16px}
 .acc-version{padding:6px 2px 18px;text-align:right}
@@ -422,6 +423,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
     </div>
     <div class="rec-timer" id="rtimer" style="display:none">00:00</div>
     <div class="rec-hint" id="rhint" style="display:none">Palieskite, kad pradėtumėte įrašymą</div>
+    <div class="rec-warn" id="rec-warn" style="display:none"></div>
     <div class="rec-ctrls" id="rctrls" style="display:none">
       <button class="cbtn" id="btn-pause" onclick="pauseRec()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
@@ -666,7 +668,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v39';
+const APP_VERSION='v40';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1084,6 +1086,7 @@ function goRecord(){
   document.getElementById('rtimer').style.display='none';
   document.getElementById('rhint').textContent='Palieskite, kad pradėtumėte įrašymą';
   document.getElementById('rhint').style.display='none';
+  document.getElementById('rec-warn').style.display='none';
   document.getElementById('rec-choose').style.display='flex';
   document.getElementById('rctrls').style.display='none';
   document.getElementById('rec-foot').style.display='none';
@@ -1092,6 +1095,144 @@ function goRecord(){
   document.getElementById('btn-pause').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>';
   document.getElementById('btn-pause').onclick=pauseRec;
   show('p-record');
+}
+// ── BACKGROUND-RECORDING RESILIENCE (Android/iOS) ──
+// The core problem: mobile browsers throttle or kill audio capture when the screen
+// locks, the app is backgrounded, or a phone call arrives. There is NO reliable way to
+// record in the background inside an iOS PWA — so on iOS we only warn the person.
+// On Android we can do much better with three layers:
+//   1) Screen Wake Lock — keeps the screen from locking while recording (the most
+//      common interruption cause disappears entirely).
+//   2) A silent looping <audio> element — Chrome on Android treats a tab that is
+//      playing audio as "media playback" and keeps its process at higher priority,
+//      which protects the MediaRecorder if the person switches apps briefly.
+//   3) Interruption detection on the microphone track (mute/ended) — an incoming
+//      call takes the mic away from us; we detect it, seal the current segment
+//      (everything recorded so far is safe), and show a "resume" state instead of
+//      silently recording nothing.
+const IS_IOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+let wakeLock=null,keepAliveAudio=null,muteTimer=null;
+async function acquireWakeLock(){
+  if(!('wakeLock' in navigator))return; // not supported (older browsers) — other layers still help
+  try{
+    wakeLock=await navigator.wakeLock.request('screen');
+    // The OS releases the lock automatically when the tab is hidden; we re-acquire it
+    // in the visibilitychange handler below when the person comes back.
+    wakeLock.addEventListener('release',()=>{wakeLock=null;});
+  }catch(e){wakeLock=null;} // e.g. low battery mode can refuse — fine, just degrade
+}
+function releaseWakeLock(){try{wakeLock&&wakeLock.release();}catch(e){}wakeLock=null;}
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'&&(rstate==='recording'||rstate==='paused')&&!wakeLock)acquireWakeLock();
+});
+function startKeepAliveAudio(){
+  if(IS_IOS)return; // iOS gives no priority benefit for this and may pause it anyway
+  try{
+    if(!keepAliveAudio){
+      // Tiny valid silent WAV (a few samples of silence), looped forever. Volume is a
+      // hair above zero because some browsers deprioritize truly-muted playback.
+      keepAliveAudio=new Audio('data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA');
+      keepAliveAudio.loop=true;keepAliveAudio.volume=0.01;
+    }
+    keepAliveAudio.play().catch(()=>{}); // autoplay refusal is non-fatal
+  }catch(e){}
+}
+function stopKeepAliveAudio(){try{keepAliveAudio&&keepAliveAudio.pause();}catch(e){}}
+function startRecordingGuards(){
+  acquireWakeLock();
+  startKeepAliveAudio();
+  attachTrackWatch();
+  const warn=document.getElementById('rec-warn');
+  if(warn&&IS_IOS){
+    warn.textContent='Įrašymo metu užrakinus telefono ekraną ar išjungus programėlę, įrašymas nutraukiamas.';
+    warn.style.display='block';
+  }
+}
+function stopRecordingGuards(){
+  releaseWakeLock();
+  stopKeepAliveAudio();
+  clearTimeout(muteTimer);muteTimer=null;
+  const warn=document.getElementById('rec-warn');
+  if(warn)warn.style.display='none';
+}
+function attachTrackWatch(){
+  const track=ms&&ms.getAudioTracks&&ms.getAudioTracks()[0];
+  if(!track)return;
+  // 'mute' can flicker briefly for innocent reasons (e.g. iOS backgrounding for a
+  // second), so we debounce: only treat it as a real interruption if the track is
+  // still muted after 1.2s. 'ended' is unambiguous — the mic is gone (call answered,
+  // permission revoked) and the stream can never produce audio again.
+  track.onmute=()=>{
+    if(rstate!=='recording')return;
+    clearTimeout(muteTimer);
+    muteTimer=setTimeout(()=>{if(rstate==='recording'&&track.muted)interruptRec();},1200);
+  };
+  track.onunmute=()=>{clearTimeout(muteTimer);muteTimer=null;};
+  track.onended=()=>{if(rstate==='recording')interruptRec();};
+}
+function interruptRec(){
+  if(rstate!=='recording')return;
+  clearInterval(tick);stopWave();
+  rstate='interrupted';
+  // Seal whatever was captured so far into a finished segment — this is the moment
+  // that makes an interruption non-destructive: even if the person never resumes,
+  // everything up to the call is saveable.
+  try{
+    const oldMr=mr;
+    oldMr.onstop=()=>{
+      if(curChunks.length){segments.push(new Blob(curChunks,{type:oldMr.mimeType||'audio/webm'}));curChunks=[];}
+    };
+    if(oldMr&&oldMr.state!=='inactive')oldMr.stop();
+  }catch(e){}
+  document.getElementById('rec-ring').className='rec-ring paused';
+  document.getElementById('rhint').textContent='Įrašymas pertrauktas — galimai skambutis ar kita programa. Iki šiol įrašyta dalis saugi. Palieskite ▶ tęsti.';
+  const btn=document.getElementById('btn-pause');
+  btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
+  btn.onclick=resumeAfterInterrupt;
+}
+async function resumeAfterInterrupt(){
+  if(rstate!=='interrupted')return;
+  try{
+    const track=ms&&ms.getAudioTracks&&ms.getAudioTracks()[0];
+    if(!track||track.readyState==='ended'||track.muted){
+      // The old stream is dead — request the microphone anew and rebuild the
+      // analyser on top of the fresh stream so the waveform comes back to life too.
+      try{ms&&ms.getTracks().forEach(t=>t.stop());}catch(e){}
+      ms=await navigator.mediaDevices.getUserMedia({audio:true});
+      attachTrackWatch();
+      const ctx=new AudioContext();
+      if(ctx.state==='suspended'){try{await ctx.resume();}catch(e){}}
+      analyser=ctx.createAnalyser();analyser.fftSize=64;
+      ctx.createMediaStreamSource(ms).connect(analyser);
+    }
+    // The interruption sealed a segment at time `rms`, so the rotation clock restarts
+    // from here — the next rotation happens SEGMENT_MS from now, not from the old mark.
+    lastSegStartRms=rms;
+    rstate='recording';
+    startNewMediaRecorder();
+    startTick();
+    startWave();
+    acquireWakeLock();
+    startKeepAliveAudio();
+    document.getElementById('rec-ring').className='rec-ring on';
+    document.getElementById('rhint').textContent='Įrašoma — palieskite, kad pristabdytumėte';
+    const btn=document.getElementById('btn-pause');
+    btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>';
+    btn.onclick=pauseRec;
+  }catch(e){
+    toast('Nepavyko atnaujinti įrašymo — mikrofonas nepasiekiamas. Iki šiol įrašyta dalis saugi, galite ją išsaugoti.');
+  }
+}
+// One shared timer for all "recording is running" states. Critically, it includes the
+// segment-rotation check — the old resumeRec() had its own timer WITHOUT that check,
+// which meant a long recording resumed after a manual pause stopped rotating segments
+// and would grow one giant (potentially >6 MB) segment. Every path now uses this.
+function startTick(){
+  clearInterval(tick);
+  tick=setInterval(()=>{
+    rms+=100;document.getElementById('rtimer').textContent=ms2t(rms);
+    if(rstate==='recording'&&rms-lastSegStartRms>=SEGMENT_MS){lastSegStartRms=rms;rotateSegment();}
+  },100);
 }
 async function toggleRec(){
   if(rstate!=='idle')return;
@@ -1113,12 +1254,8 @@ async function toggleRec(){
     startWave();
     rstate='recording';rms=0;lastSegStartRms=0;segments=[];
     startNewMediaRecorder();
-    tick=setInterval(()=>{
-      rms+=100;document.getElementById('rtimer').textContent=ms2t(rms);
-      // Rotation only checked while actively recording — pausing already clears this
-      // interval, so the segment clock naturally pauses/resumes along with it.
-      if(rstate==='recording'&&rms-lastSegStartRms>=SEGMENT_MS){lastSegStartRms=rms;rotateSegment();}
-    },100);
+    startTick();
+    startRecordingGuards();
     document.getElementById('rec-ring').className='rec-ring on';
     document.getElementById('rhint').textContent='Įrašoma — palieskite, kad pristabdytumėte';
     document.getElementById('rctrls').style.display='flex';
@@ -1161,8 +1298,8 @@ function pauseRec(){
 function resumeRec(){
   if(rstate!=='paused')return;
   mr.resume();
-  tick=setInterval(()=>{rms+=100;document.getElementById('rtimer').textContent=ms2t(rms);},100);
   rstate='recording';
+  startTick();
   document.getElementById('rec-ring').className='rec-ring on';
   startWave();
   document.getElementById('rhint').textContent='Įrašoma — palieskite, kad pristabdytumėte';
@@ -1171,6 +1308,7 @@ function resumeRec(){
 }
 function stopRec(){
   clearInterval(tick);stopWave();
+  stopRecordingGuards();
   if(mr&&mr.state!=='inactive')mr.pause();
   rstate='stopped';
   document.getElementById('rec-ring').className='rec-ring paused';
@@ -1228,6 +1366,7 @@ async function confirmUpload(){
 }
 function cancelRecord(){
   clearInterval(tick);stopWave();
+  stopRecordingGuards();
   if(mr&&mr.state!=='inactive')mr.stop();
   ms&&ms.getTracks().forEach(t=>t.stop());
   mr=null;ms=null;rstate='idle';chunks=[];segments=[];curChunks=[];
@@ -1239,6 +1378,7 @@ async function saveRecord(){
   clearInterval(tick);stopWave();
   const dur=rms;
   const finalize=async()=>{
+    stopRecordingGuards();
     ms&&ms.getTracks().forEach(t=>t.stop());
     show('p-transcribing');
     const estSec=Math.max(5,Math.round(dur/1000*0.15));
