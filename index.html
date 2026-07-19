@@ -14,6 +14,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.0/lame.min.js"></script>
 <style>
 :root{
   --bg:#000;
@@ -501,8 +502,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
       <div id="sum-outline" class="sum-empty">Struktūros dar nėra.</div>
     </div>
 
-    <button class="sum-gen-btn" id="btn-edit-sum" onclick="editSummary()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;margin-top:8px">Redaguoti santrauką</button>
-    <button class="sum-gen-btn" id="btn-regen-sum" onclick="regenSummary()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;margin-top:8px">Pergeneruoti santrauką</button>
+    <div class="sum-btn-row" style="display:flex;gap:6px;margin-top:8px">
+      <button class="sum-gen-btn" id="btn-edit-sum" onclick="editSummary()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;flex:1;margin-top:0;padding:12px 6px;font-size:13.5px">Redaguoti santrauką</button>
+      <button class="sum-gen-btn" id="btn-regen-sum" onclick="regenSummary()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;flex:1;margin-top:0;padding:12px 6px;font-size:13.5px">Pergeneruoti santrauką</button>
+    </div>
     <button class="sum-gen-btn" id="btn-gen-sum" onclick="retrySummarize()" style="background:var(--surface2);border:1px solid var(--border);color:var(--white);display:none;margin-top:8px">Generuoti santrauką</button>
     <button class="btn-del" onclick="deleteRec()">Ištrinti įrašą</button>
   </div>
@@ -669,7 +672,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v41';
+const APP_VERSION='v42';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -903,7 +906,7 @@ async function openTrash(){
     if(!r.deletedAt)continue;
     const daysPassed=(now-new Date(r.deletedAt).getTime())/86400000;
     if(daysPassed>=7){
-      purgeRecording(d.id,r.audioPath);
+      purgeRecording(d.id,r.audioPath,r.audioSegmentPaths);
     }else{
       keep.push({id:d.id,title:r.title,deletedAt:r.deletedAt,daysLeft:Math.max(1,Math.ceil(7-daysPassed))});
     }
@@ -928,6 +931,7 @@ async function deleteAccount(){
       const r=d.data();
       idbDeleteBlob(d.id).catch(()=>{});
       if(r.audioPath)storage.ref(r.audioPath).delete().catch(()=>{});
+      if(r.audioSegmentPaths&&r.audioSegmentPaths.length)r.audioSegmentPaths.forEach(p=>storage.ref(p).delete().catch(()=>{}));
       await d.ref.delete();
     }
     await db.collection('users').doc(user.uid).delete();
@@ -1351,19 +1355,120 @@ function cancelUpload(){
   document.getElementById('upload-foot').style.display='none';
   document.getElementById('rec-title-input').value='';
 }
+// ── UPLOADED FILE SEGMENTATION ──
+// Unlike live recordings (already pre-split into segments by MediaRecorder rotation —
+// see SEGMENT_MS above), an uploaded file arrives as one single blob of unknown length.
+// To reuse the exact same transcribeSegments/Storage/multi-device-player pipeline that
+// long live recordings already use, we decode the file with the Web Audio API and,
+// if it's longer than SEGMENT_MS, re-encode it into several independent MP3 segments
+// (mono, 64 kbps via lamejs — small files, ~1-2 MB per 4 min, well under the client's
+// 6 MB per-part safeguard). Short files skip re-encoding entirely and go through as-is —
+// no need to pay the decode/encode cost when there's nothing to split.
+const UPLOAD_MAX_MS=40*60*1000; // 40 min ceiling for uploaded files
+function mixToMonoFloat(audioBuffer){
+  const len=audioBuffer.length,ch=audioBuffer.numberOfChannels;
+  if(ch===1)return audioBuffer.getChannelData(0);
+  const out=new Float32Array(len);
+  for(let c=0;c<ch;c++){
+    const data=audioBuffer.getChannelData(c);
+    for(let i=0;i<len;i++)out[i]+=data[i]/ch;
+  }
+  return out;
+}
+function encodeMonoPcmToMp3(floatSamples,sampleRate){
+  const int16=new Int16Array(floatSamples.length);
+  for(let i=0;i<floatSamples.length;i++){
+    const s=Math.max(-1,Math.min(1,floatSamples[i]));
+    int16[i]=s<0?s*0x8000:s*0x7FFF;
+  }
+  const encoder=new lamejs.Mp3Encoder(1,sampleRate,64);
+  const blockSize=1152,chunks=[];
+  for(let i=0;i<int16.length;i+=blockSize){
+    const buf=encoder.encodeBuffer(int16.subarray(i,i+blockSize));
+    if(buf.length>0)chunks.push(buf);
+  }
+  const end=encoder.flush();
+  if(end.length>0)chunks.push(end);
+  return new Blob(chunks,{type:'audio/mpeg'});
+}
+// Returns {segments, durMs}. Throws with a user-facing LT message on failure (bad file,
+// too long, etc.) — the caller shows it as a toast and returns the person to the home screen.
+async function segmentUploadedFile(file){
+  const estEl=document.getElementById('tr-estimate');
+  if(estEl)estEl.textContent='Analizuojamas garso failas…';
+  let ctx,audioBuffer;
+  try{
+    ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const arrayBuffer=await file.arrayBuffer();
+    audioBuffer=await ctx.decodeAudioData(arrayBuffer);
+  }catch(e){
+    try{ctx&&ctx.close();}catch(e2){}
+    // The BROWSER couldn't decode this format (e.g. .ogg on iOS Safari) — but the
+    // transcription server may still handle it fine, and it did before this feature
+    // existed. Fall back to the old single-file path instead of refusing: the 6 MB
+    // per-part guard in transcribeBlob still protects the server from oversized files,
+    // and a genuinely corrupt file will surface as a clear transcription error with
+    // the recording already safely saved.
+    console.warn('Upload decode failed — falling back to single-file path:',e);
+    return {segments:[file],durMs:0};
+  }
+  const durMs=Math.round(audioBuffer.duration*1000);
+  if(durMs>UPLOAD_MAX_MS){
+    try{ctx.close();}catch(e){}
+    throw new Error('Failas per ilgas ('+ms2t(durMs)+'). Didžiausia leidžiama trukmė — '+ms2t(UPLOAD_MAX_MS)+'.');
+  }
+  if(durMs<=SEGMENT_MS){
+    try{ctx.close();}catch(e){}
+    return {segments:[file],durMs};
+  }
+  // Long file → we must re-encode into MP3 segments. This needs the lamejs library;
+  // if its CDN script failed to load (offline at page load, CDN hiccup), fail with a
+  // clear message now instead of an opaque "lamejs is not defined" ReferenceError.
+  if(typeof lamejs==='undefined'){
+    try{ctx.close();}catch(e){}
+    throw new Error('Nepavyko paruošti ilgo failo apdorojimo — perkraukite programėlę ir bandykite dar kartą.');
+  }
+  const sampleRate=audioBuffer.sampleRate;
+  const mono=mixToMonoFloat(audioBuffer);
+  const samplesPerSegment=Math.floor(sampleRate*(SEGMENT_MS/1000));
+  const totalSegments=Math.ceil(mono.length/samplesPerSegment);
+  const segments=[];
+  for(let s=0;s<totalSegments;s++){
+    if(estEl)estEl.textContent=`Failas dalijamas — dalis ${s+1} iš ${totalSegments}…`;
+    const start=s*samplesPerSegment;
+    const end=Math.min(start+samplesPerSegment,mono.length);
+    segments.push(encodeMonoPcmToMp3(mono.subarray(start,end),sampleRate));
+    // Yield to the UI thread between segments so the progress text actually repaints
+    // and a big file doesn't freeze the page for several seconds straight.
+    await new Promise(r=>setTimeout(r,0));
+  }
+  try{ctx.close();}catch(e){}
+  return {segments,durMs};
+}
 async function confirmUpload(){
   if(!_uploadBlob){toast('Failas nepasirinktas.');return;}
-  const blob=_uploadBlob;
+  const file=_uploadBlob;
   const inputTitle=document.getElementById('rec-title-input').value.trim();
   _uploadBlob=null;
   show('p-transcribing');
-  const estSec=Math.max(5,Math.round(30*0.15));
   const estEl=document.getElementById('tr-estimate');
-  if(estEl)estEl.textContent='Tekstas bus paruoštas maždaug per '+estSec+' sek.';
-  // Uploaded files aren't recorded through our app, so they can't be pre-split into
-  // segments the way live recordings are — they still go through the single-file path.
-  // If a very long uploaded file becomes an issue, that would need a separate fix.
-  await autoTranscribe([blob],0,inputTitle);
+  if(estEl)estEl.textContent='Analizuojamas garso failas…';
+  let segments,durMs;
+  try{
+    ({segments,durMs}=await segmentUploadedFile(file));
+  }catch(e){
+    toast(e.message||'Nepavyko apdoroti failo.');
+    goHome();
+    return;
+  }
+  if(estEl){
+    estEl.textContent=segments.length>1
+      ?'Ilgas įrašas — tekstas bus ruošiamas dalimis, tai užtruks šiek tiek ilgiau…'
+      :(durMs>0
+        ?'Tekstas bus paruoštas maždaug per '+Math.max(5,Math.round(durMs/1000*0.15))+' sek.'
+        :'Ruošiamas tekstas…');
+  }
+  await autoTranscribe(segments,durMs,inputTitle);
 }
 function cancelRecord(){
   clearInterval(tick);stopWave();
@@ -1499,7 +1604,7 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
     // Upload the audio to Firebase Storage in the background (don't block the UI on this).
     // Retries a few times with backoff; if it still fails, the user gets a clear toast
     // instead of silently never getting a cloud copy of a long recording.
-    uploadAudioToStorageWithRetry(id,blob);
+    uploadAudioToStorageWithRetry(id,segmentsBlobs.length>1?segmentsBlobs:blob);
   }catch(err){
     toast('Nepavyko išsaugoti įrašo: '+(err&&err.message?err.message:'nežinoma klaida'));
     goHome();
@@ -1603,13 +1708,23 @@ async function openDetail(id){
     // seekable across browsers (each MediaRecorder restart writes its own container
     // header), so we play segments back-to-back through loadAudioSegments() instead.
     let segs=(segCount>1)?await idbGetSegments(id).catch(()=>null):null;
-    let blob=await idbGetBlob(id).catch(()=>null);
+    let blob=null;
+    if(!(segs&&segs.length>1)){
+      blob=await idbGetBlob(id).catch(()=>null);
+    }
     if(!blob&&!(segs&&segs.length>1)){
-      let audioPath=cached?.audioPath;
-      if(!audioPath){
-        try{const s=await recPromise;audioPath=s.exists?s.data().audioPath:null;}catch(e){}
+      let audioPath=cached?.audioPath,segmentPaths=cached?.audioSegmentPaths;
+      if(!audioPath&&!segmentPaths){
+        try{
+          const s=await recPromise;
+          if(s.exists){audioPath=s.data().audioPath;segmentPaths=s.data().audioSegmentPaths;}
+        }catch(e){}
       }
-      blob=await downloadAudioFromStorage(id,audioPath);
+      if(segmentPaths&&segmentPaths.length>1){
+        segs=await downloadSegmentsFromStorage(id,segmentPaths);
+      }else{
+        blob=await downloadAudioFromStorage(id,audioPath);
+      }
     }
     if(recId!==id)return;
     if(segs&&segs.length>1){
@@ -1621,10 +1736,10 @@ async function openDetail(id){
     }
     // If a previous sync attempt failed, quietly try again now that the person is
     // back on this recording — no need to wait for them to notice or take action.
-    if(blob){
+    if(blob||(segs&&segs.length)){
       try{
         const s=await recPromise;
-        if(s.exists&&s.data().audioSyncStatus==='failed')uploadAudioToStorageWithRetry(id,blob);
+        if(s.exists&&s.data().audioSyncStatus==='failed')uploadAudioToStorageWithRetry(id,(segs&&segs.length>1)?segs:blob);
       }catch(e){}
     }
   })();
@@ -1998,11 +2113,12 @@ async function deleteRec(){
   await db.collection('users').doc(user.uid).collection('recordings').doc(idToDelete).update({deletedAt:new Date().toISOString()});
   toast('Perkelta į šiukšliadėžę.');goHome();
 }
-async function purgeRecording(id,audioPath){
+async function purgeRecording(id,audioPath,segmentPaths){
   try{
     await db.collection('users').doc(user.uid).collection('recordings').doc(id).delete();
     idbDeleteBlob(id).catch(()=>{});
     if(audioPath)storage.ref(audioPath).delete().catch(()=>{});
+    if(segmentPaths&&segmentPaths.length)segmentPaths.forEach(p=>storage.ref(p).delete().catch(()=>{}));
   }catch(e){console.warn('Permanent purge failed:',e);}
 }
 async function restoreRecording(id){
@@ -2308,6 +2424,9 @@ async function doTranscribe(){
     // opened on a different device, where only the combined file was synced), fall back
     // to the single combined file; that still works for shorter recordings.
     let segs=rec.segmentCount>1?await idbGetSegments(recId).catch(()=>null):null;
+    if(!(segs&&segs.length>1)&&rec.audioSegmentPaths&&rec.audioSegmentPaths.length>1){
+      segs=await downloadSegmentsFromStorage(recId,rec.audioSegmentPaths);
+    }
     let transcript;
     if(segs&&segs.length){
       transcript=await transcribeSegments(segs);
@@ -2408,23 +2527,59 @@ function audioExtFor(mimeType){
   if(t.includes('ogg'))return 'ogg';
   return 'webm';
 }
-async function uploadAudioToStorageWithRetry(id,blob,attempt=1){
+// blobOrSegments: a single Blob (short recordings/uploads — unchanged legacy path,
+// writes rec.audioPath) OR an array of Blobs (long recordings/uploads — writes
+// rec.audioSegmentPaths, one Storage object per segment). Uploading segments
+// individually — instead of one concatenated Blob — is what lets a DIFFERENT device
+// reconstruct proper back-to-back segment playback; downloading and playing a single
+// concatenated file only ever shows the first segment's duration/seek range, which was
+// the "rodo tik 4:48 vietoj 30:53" bug.
+async function uploadAudioToStorageWithRetry(id,blobOrSegments,attempt=1){
   const MAX_ATTEMPTS=3;
+  const isMulti=Array.isArray(blobOrSegments);
   try{
-    const ext=audioExtFor(blob.type);
-    const path=`recordings/${user.uid}/${id}.${ext}`;
-    await storage.ref(path).put(blob,{contentType:blob.type||'application/octet-stream'});
-    await db.collection('users').doc(user.uid).collection('recordings').doc(id).update({audioPath:path,audioUploadedAt:new Date().toISOString(),audioSyncStatus:'synced'});
+    if(isMulti){
+      const segs=blobOrSegments;
+      const paths=[];
+      for(let i=0;i<segs.length;i++){
+        const ext=audioExtFor(segs[i].type);
+        const path=`recordings/${user.uid}/${id}_seg${i}.${ext}`;
+        await storage.ref(path).put(segs[i],{contentType:segs[i].type||'application/octet-stream'});
+        paths.push(path);
+      }
+      await db.collection('users').doc(user.uid).collection('recordings').doc(id).update({audioSegmentPaths:paths,audioUploadedAt:new Date().toISOString(),audioSyncStatus:'synced'});
+    }else{
+      const blob=blobOrSegments;
+      const ext=audioExtFor(blob.type);
+      const path=`recordings/${user.uid}/${id}.${ext}`;
+      await storage.ref(path).put(blob,{contentType:blob.type||'application/octet-stream'});
+      await db.collection('users').doc(user.uid).collection('recordings').doc(id).update({audioPath:path,audioUploadedAt:new Date().toISOString(),audioSyncStatus:'synced'});
+    }
   }catch(e){
     console.warn(`Audio upload to Storage failed (bandymas ${attempt}/${MAX_ATTEMPTS}):`,e);
     if(attempt<MAX_ATTEMPTS){
-      setTimeout(()=>uploadAudioToStorageWithRetry(id,blob,attempt+1),1500*attempt);
+      setTimeout(()=>uploadAudioToStorageWithRetry(id,blobOrSegments,attempt+1),1500*attempt);
     }else{
       try{await db.collection('users').doc(user.uid).collection('recordings').doc(id).update({audioSyncStatus:'failed'});}catch(e2){}
       // Only surface this if the person is still on this recording's page — a toast
       // popping up out of context after they've navigated elsewhere would be confusing.
       if(recId===id)toast('Įrašas saugus šiame įrenginyje, bet nepavyko sinchronizuoti į debesį. Pabandysime vėl, kai atidarysite šį įrašą kitą kartą.');
     }
+  }
+}
+async function downloadSegmentsFromStorage(id,segmentPaths){
+  if(!segmentPaths||!segmentPaths.length)return null;
+  try{
+    const blobs=await Promise.all(segmentPaths.map(async p=>{
+      const url=await storage.ref(p).getDownloadURL();
+      const resp=await fetch(url);
+      return resp.blob();
+    }));
+    idbSaveSegments(id,blobs).catch(()=>{}); // cache locally for next time, best-effort
+    return blobs;
+  }catch(e){
+    console.warn('Cloud segment download failed:',e);
+    return null;
   }
 }
 async function downloadAudioFromStorage(id,audioPath){
