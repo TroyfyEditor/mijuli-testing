@@ -672,7 +672,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v42';
+const APP_VERSION='v43';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1185,7 +1185,11 @@ function interruptRec(){
   try{
     const oldMr=mr;
     oldMr.onstop=()=>{
-      if(curChunks.length){segments.push(new Blob(curChunks,{type:oldMr.mimeType||'audio/webm'}));curChunks=[];}
+      if(curChunks.length){
+        const seg=new Blob(curChunks,{type:oldMr.mimeType||'audio/webm'});
+        segments.push(seg);curChunks=[];
+        queueLiveTranscription(segments.length-1,seg); // sealed part is final — start now
+      }
     };
     if(oldMr&&oldMr.state!=='inactive')oldMr.stop();
   }catch(e){}
@@ -1257,7 +1261,7 @@ async function toggleRec(){
     analyser=ctx.createAnalyser();analyser.fftSize=64;
     ctx.createMediaStreamSource(ms).connect(analyser);
     startWave();
-    rstate='recording';rms=0;lastSegStartRms=0;segments=[];
+    rstate='recording';rms=0;lastSegStartRms=0;segments=[];liveTr=[];
     startNewMediaRecorder();
     startTick();
     startRecordingGuards();
@@ -1286,10 +1290,34 @@ function startNewMediaRecorder(){
 function rotateSegment(){
   const oldMr=mr;
   oldMr.onstop=()=>{
-    if(curChunks.length)segments.push(new Blob(curChunks,{type:oldMr.mimeType||'audio/webm'}));
+    if(curChunks.length){
+      const seg=new Blob(curChunks,{type:oldMr.mimeType||'audio/webm'});
+      segments.push(seg);
+      // LIVE TRANSCRIPTION: this segment is now final and will never change, so start
+      // transcribing it in the background immediately instead of waiting for the person
+      // to press "Save". By the time a long recording ends, most of its parts are
+      // already done — the final wait shrinks from ~N segments to roughly just the last
+      // one. If this background attempt fails (offline, server hiccup), nothing is
+      // lost: transcribeSegments() simply re-transcribes that part at save time,
+      // exactly as before this optimization existed.
+      queueLiveTranscription(segments.length-1,seg);
+    }
     if(rstate==='recording')startNewMediaRecorder(); // resume immediately — gap is a few ms, inaudible
   };
   oldMr.stop();
+}
+// Background transcription results for segments sealed during an ongoing recording.
+// liveTr[i] is a promise resolving to {ok:true,text} (success — text may be '' for a
+// silent part), {ok:false} (failed — retry at save time), never rejecting.
+let liveTr=[];
+function queueLiveTranscription(idx,blob){
+  liveTr[idx]=transcribeBlobWithRetry(blob)
+    .then(text=>({ok:true,text:text||''}))
+    .catch(e=>{
+      if(e.message==='Tuščias tekstas')return {ok:true,text:''}; // silence is a valid result
+      console.warn(`Live transcription of segment ${idx} failed — will retry at save:`,e);
+      return {ok:false};
+    });
 }
 function pauseRec(){
   if(rstate!=='recording')return;
@@ -1475,7 +1503,7 @@ function cancelRecord(){
   stopRecordingGuards();
   if(mr&&mr.state!=='inactive')mr.stop();
   ms&&ms.getTracks().forEach(t=>t.stop());
-  mr=null;ms=null;rstate='idle';chunks=[];segments=[];curChunks=[];
+  mr=null;ms=null;rstate='idle';chunks=[];segments=[];curChunks=[];liveTr=[];
   document.getElementById('rec-title-input').value='';
   goHome();
 }
@@ -1490,9 +1518,10 @@ async function saveRecord(){
     const estSec=Math.max(5,Math.round(dur/1000*0.15));
     const estEl=document.getElementById('tr-estimate');
     if(estEl)estEl.textContent=segments.length>1
-      ?'Ilgas įrašas — tekstas bus ruošiamas dalimis, tai užtruks šiek tiek ilgiau…'
+      ?'Ruošiamas tekstas — didžioji dalis jau apdorota įrašymo metu…'
       :'Tekstas bus paruoštas maždaug per '+estSec+' sek.';
-    await autoTranscribe(segments.slice(),dur);
+    const live=liveTr;liveTr=[]; // hand results over; a fresh recording starts clean
+    await autoTranscribe(segments.slice(),dur,undefined,live);
   };
   if(mr&&mr.state!=='inactive'){
     mr.onstop=()=>{
@@ -1550,25 +1579,37 @@ async function transcribeBlobWithRetry(blob,maxAttempts=3){
   }
   throw lastErr;
 }
-async function transcribeSegments(segmentsBlobs){
-  if(segmentsBlobs.length===1)return transcribeBlob(segmentsBlobs[0]);
+// liveResults (optional): background transcription promises collected DURING the
+// recording (see queueLiveTranscription). For each segment we first check whether its
+// live attempt already succeeded — if so, its text is used instantly with no network
+// call; if it failed or never ran (e.g. offline at the time), the segment is
+// transcribed here exactly as before. Order is preserved by index either way.
+async function transcribeSegments(segmentsBlobs,liveResults){
+  if(segmentsBlobs.length===1&&!(liveResults&&liveResults[0]))return transcribeBlob(segmentsBlobs[0]);
   const estEl=document.getElementById('tr-estimate');
   const parts=[];
   for(let i=0;i<segmentsBlobs.length;i++){
     if(estEl)estEl.textContent=`Apdorojama dalis ${i+1} iš ${segmentsBlobs.length}…`;
-    try{
-      const text=await transcribeBlobWithRetry(segmentsBlobs[i]);
-      if(text)parts.push(text);
-    }catch(e){
-      if(e.message==='Tuščias tekstas')continue;
-      throw e;
+    let text=null;
+    if(liveResults&&liveResults[i]){
+      const live=await liveResults[i]; // never rejects — resolves {ok,text}
+      if(live&&live.ok)text=live.text;
     }
+    if(text===null){
+      try{
+        text=await transcribeBlobWithRetry(segmentsBlobs[i]);
+      }catch(e){
+        if(e.message==='Tuščias tekstas')continue;
+        throw e;
+      }
+    }
+    if(text)parts.push(text);
   }
   const merged=parts.join(' ').replace(/\s{2,}/g,' ').trim();
   if(!merged)throw new Error('Tuščias tekstas');
   return merged;
 }
-async function autoTranscribe(segmentsBlobs,dur,customTitle){
+async function autoTranscribe(segmentsBlobs,dur,customTitle,liveResults){
   const id=crypto.randomUUID();
   const now=new Date().toISOString();
   const inputTitle=customTitle||document.getElementById('rec-title-input').value.trim();
@@ -1615,7 +1656,7 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle){
   // 2) Now attempt transcription. If it fails, the recording still exists — just show
   //    the error and let the person open it and retry via the "Konvertuoti į tekstą" button.
   try{
-    const transcript=await transcribeSegments(segmentsBlobs);
+    const transcript=await transcribeSegments(segmentsBlobs,liveResults);
     const upd={transcript,transcriptionStatus:'completed',updatedAt:new Date().toISOString()};
     await db.collection('users').doc(user.uid).collection('recordings').doc(id).update(upd);
     trackUsage(dur/60000,0);
