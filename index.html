@@ -214,10 +214,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 .tr-icon-btn.on{background:var(--blue-dim);border-color:var(--blue-border);color:var(--white)}
 .tr-icon-btn svg{width:18px;height:18px}
 /* ── SPELL-FIX (AI rašybos taisymas) ── */
-@keyframes spellPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.82)}}
+@keyframes spellPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.78)}}
 @keyframes spellFlash{0%{transform:scale(1);color:inherit}40%{transform:scale(1.35);color:var(--blue)}100%{transform:scale(1);color:inherit}}
-.tr-icon-btn.spell-pulse svg{animation:spellPulse .65s ease-in-out infinite}
+.tr-icon-btn.spell-pulse svg{animation:spellPulse 1.4s ease-in-out infinite}
 .tr-icon-btn.spell-flash svg{animation:spellFlash .5s ease-out}
+#btn-spell-tr svg{width:24px;height:24px}
 .spell-chg{text-decoration:underline;text-decoration-color:var(--blue);text-underline-offset:3px}
 .tr-inline-row{display:none;align-items:center;gap:8px;padding:10px 2px 2px;font-size:13px;color:var(--muted)}
 .tr-inline-row.show{display:flex}
@@ -545,8 +546,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
         </button>
       </div>
       <div class="tr-inline-row" id="spell-feedback-row">
-        <span>Pakeitimai pabraukti</span>
-        <span class="spacer"></span>
+        <span id="spell-feedback-label" style="flex:1;line-height:1.4">Pakeitimai pabraukti</span>
         <button class="tr-mini-btn ok" onclick="confirmSpellFix()" title="Tinka">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
         </button>
@@ -709,7 +709,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v43';
+const APP_VERSION='v45';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -2635,7 +2635,7 @@ async function toggleSpellFix(){
     btn.classList.add('spell-flash');
     setTimeout(()=>btn.classList.remove('spell-flash'),500);
     if(corrected.trim()===current.trim()){
-      toast(blocked?'AI pasiūlymas atrodė per rizikingas — tekstas paliktas nepakeistas.':'Rašybos klaidų nerasta ✓');
+      toast(blocked?'AI pasiūlymas buvo perrašęs tekstą iš esmės — paliktas originalas.':'Rašybos klaidų nerasta ✓');
       btn.disabled=false;
       return;
     }
