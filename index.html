@@ -213,6 +213,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 .tr-icon-btn:disabled{opacity:.25;cursor:not-allowed}
 .tr-icon-btn.on{background:var(--blue-dim);border-color:var(--blue-border);color:var(--white)}
 .tr-icon-btn svg{width:18px;height:18px}
+/* ── SPELL-FIX (AI rašybos taisymas) ── */
+@keyframes spellPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.82)}}
+@keyframes spellFlash{0%{transform:scale(1);color:inherit}40%{transform:scale(1.35);color:var(--blue)}100%{transform:scale(1);color:inherit}}
+.tr-icon-btn.spell-pulse svg{animation:spellPulse .65s ease-in-out infinite}
+.tr-icon-btn.spell-flash svg{animation:spellFlash .5s ease-out}
+.spell-chg{text-decoration:underline;text-decoration-color:var(--blue);text-underline-offset:3px}
+.tr-inline-row{display:none;align-items:center;gap:8px;padding:10px 2px 2px;font-size:13px;color:var(--muted)}
+.tr-inline-row.show{display:flex}
+.tr-inline-row .spacer{flex:1}
+.tr-mini-btn{width:30px;height:30px;border-radius:50%;background:var(--surface2);border:1px solid var(--border);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.tr-mini-btn:active{opacity:.5}
+.tr-mini-btn svg{width:15px;height:15px}
+.tr-mini-btn.ok svg{color:#22c55e}
+.tr-mini-btn.bad svg{color:var(--red)}
 .highlighted-word{background:rgba(255,220,0,.3);border-radius:2px;padding:0 1px;cursor:pointer}
 .tap-word{cursor:pointer;border-radius:2px;padding:0;display:inline;line-height:inherit;font-size:inherit}
 .tap-word.hl{background:rgba(255,220,0,.35);color:var(--white);border-radius:2px}
@@ -520,11 +534,34 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
         <button class="tr-icon-btn" id="btn-edit-tr" onclick="editTranscript()" disabled title="Redaguoti">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         </button>
+        <button class="tr-icon-btn" id="btn-spell-tr" onclick="toggleSpellFix()" disabled title="Ištaisyti rašybą">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.6 5.2L19 9l-5.4 1.8L12 16l-1.6-5.2L5 9l5.4-1.8L12 2z"/><path d="M19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14z"/></svg>
+        </button>
         <button class="tr-icon-btn" id="btn-highlight-tr" onclick="toggleHighlight()" title="Pažymėti">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
         </button>
         <button class="tr-icon-btn" id="btn-cptr" onclick="copyTranscript()" disabled title="Kopijuoti">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+      </div>
+      <div class="tr-inline-row" id="spell-feedback-row">
+        <span>Pakeitimai pabraukti</span>
+        <span class="spacer"></span>
+        <button class="tr-mini-btn ok" onclick="confirmSpellFix()" title="Tinka">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+        </button>
+        <button class="tr-mini-btn bad" onclick="rejectSpellFix()" title="Netinka">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="tr-inline-row" id="spell-confirm-row">
+        <span>Grąžinti pradinį tekstą? Prarasite savo pakeitimus.</span>
+        <span class="spacer"></span>
+        <button class="tr-mini-btn bad" onclick="confirmUndoSpellFix()" title="Patvirtinti">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+        </button>
+        <button class="tr-mini-btn" onclick="cancelUndoSpellFix()" title="Atšaukti">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
       <div class="tr-lang">
@@ -1820,7 +1857,18 @@ function renderDetail(rec){
   }else{tc.className='tr-empty';tc.textContent='Teksto dar nėra.';}
   document.getElementById('btn-cptr').disabled=!tr;
   document.getElementById('btn-edit-tr').disabled=!tr;
+  document.getElementById('btn-spell-tr').disabled=!tr;
   document.getElementById('btn-tr').style.display=tr?'none':'block';
+  // Reset any pending/stale AI spelling-fix UI state when switching recordings or
+  // language — a suggestion left over from a different transcript would be confusing
+  // and, worse, "undo" could revert the wrong text.
+  const spellKey=recId+'_'+lang;
+  if(!spellFix||spellFix.key!==spellKey){
+    spellFix=null;
+    document.getElementById('spell-feedback-row').classList.remove('show');
+    document.getElementById('spell-confirm-row').classList.remove('show');
+    document.getElementById('btn-spell-tr').classList.remove('spell-pulse','spell-flash');
+  }
   document.getElementById('tab-lt').className='lbtn'+(lang==='lt'?' on':'');
   document.getElementById('tab-en').className='lbtn'+(lang==='en'?' on':'');
   // summary
@@ -2024,6 +2072,12 @@ async function editTranscript(){
     if(val===current)return;
     const upd=lang==='lt'?{transcript:val,updatedAt:new Date().toISOString()}:{transcriptEn:val,updatedAt:new Date().toISOString()};
     await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
+    // Jei žmogus ranka pakeičia tekstą po to, kai buvo patvirtintas AI rašybos
+    // pataisymas, "grąžiklio" (undo) mygtukas nuo šiol turi paklausti patvirtinimo,
+    // kad netyčia neištrintume rankinių pakeitimų (žr. toggleSpellFix).
+    if(spellFix&&spellFix.key===(recId+'_'+lang)&&spellFix.status==='confirmed'&&val!==spellFix.corrected){
+      spellFix.manualEdit=true;
+    }
     renderDetail({...rec,...upd});toast('Išsaugota ✓');
   });
 }
@@ -2294,6 +2348,10 @@ function seekP(e){
 function skipBack(){if(ael)seekToGlobal(globalTime()-5);}
 function skipFwd(){if(ael)seekToGlobal(globalTime()+5);}
 let highlightMode=false;
+// AI rašybos taisymo (spell-fix) būsena vienam atidarytam įrašui/kalbai vienu metu.
+// null = nėra jokio aktyvaus pasiūlymo. Struktūra:
+// {key, original, corrected, correctedHtml, status:'pending'|'confirmed', manualEdit}
+let spellFix=null;
 const highlightedWords={}; // recId -> Set of word indices
 async function saveHighlights(rId){
   try{
@@ -2504,6 +2562,127 @@ async function generateSummaryData(transcript,l){
   if(!d.summary)throw new Error('Tuščia santrauka');
   trackUsage(0,1);
   return d.summary;
+}
+// ── AI SPELL-FIX (rašybos taisymas, atskiras opt-in veiksmas) ──
+// Šis webhookas veikia pagal griežtai apribotą promptą (žr. n8n workflow):
+// taiso TIK akivaizdžias rašybos klaidas, niekada neliečia skaičių/kodų/datų,
+// nieko neprideda ir netrina. Bet kokia rimtesnė klaida vis tiek turi būti
+// naudotojo peržiūrima prieš patvirtinant (žr. toggleSpellFix žemiau).
+const SPELLCHECK_WEBHOOK_URL='https://julija.app.n8n.cloud/webhook/spellfix';
+async function fetchSpellFix(transcript){
+  assertOnline();
+  const r=await fetch(SPELLCHECK_WEBHOOK_URL,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({transcript})
+  });
+  const d=await r.json();
+  if(!r.ok||d.error)throw new Error(d.error||'Rašybos taisymo klaida');
+  if(!d.corrected)throw new Error('Tuščias atsakymas');
+  return {corrected:d.corrected,blocked:!!d.blocked};
+}
+// Paprastas žodžių lygiavimas (LCS principu), naudojamas TIK pakeistų žodžių
+// pabraukimui parodyti naudotojui — pati apsauga nuo neteisingų pakeitimų
+// (skaičių/kodų neliečiamumas ir pan.) atliekama n8n pusėje, promptu.
+function spellDiffHtml(orig,corr){
+  const ow=orig.split(/(\s+)/),cw=corr.split(/(\s+)/);
+  const cleanO=ow.map(w=>w.toLowerCase().replace(/[.,!?;:„"()]/g,''));
+  const cleanC=cw.map(w=>w.toLowerCase().replace(/[.,!?;:„"()]/g,''));
+  const m=cleanO.length,n=cleanC.length;
+  const dp=Array.from({length:m+1},()=>new Array(n+1).fill(0));
+  for(let i=1;i<=m;i++)for(let j=1;j<=n;j++){
+    dp[i][j]=cleanO[i-1]===cleanC[j-1]?dp[i-1][j-1]+1:Math.max(dp[i-1][j],dp[i][j-1]);
+  }
+  let i=m,j=n;const out=[];
+  while(i>0&&j>0){
+    if(cleanO[i-1]===cleanC[j-1]){out.unshift(esc(cw[j-1]));i--;j--;}
+    else if(dp[i-1][j]>=dp[i][j-1]){i--;}
+    else{out.unshift('<span class="spell-chg">'+esc(cw[j-1])+'</span>');j--;}
+  }
+  while(j>0){out.unshift('<span class="spell-chg">'+esc(cw[j-1])+'</span>');j--;}
+  return out.join('');
+}
+async function toggleSpellFix(){
+  const rec=await getRec();if(!rec)return;
+  const key=recId+'_'+lang;
+  const btn=document.getElementById('btn-spell-tr');
+  const tc=document.getElementById('d-tr');
+  const feedbackRow=document.getElementById('spell-feedback-row');
+  const confirmRow=document.getElementById('spell-confirm-row');
+
+  // Jau turime AI pasiūlymą šiam įrašui/kalbai šioje sesijoje.
+  if(spellFix&&spellFix.key===key){
+    if(spellFix.status==='pending'){
+      // Dar nepatvirtinta — mygtuko paspaudimas = atmesti, grąžinti originalą.
+      rejectSpellFix();
+      return;
+    }
+    if(spellFix.status==='confirmed'){
+      if(spellFix.manualEdit){confirmRow.classList.add('show');return;}
+      await doUndoSpellFix();
+      return;
+    }
+  }
+
+  // Naujas pasiūlymas — reikia kviesti n8n (kaina/vėlavimas tik pirmą kartą).
+  const current=lang==='lt'?rec.transcript:rec.transcriptEn;
+  if(!current)return;
+  btn.classList.add('spell-pulse');
+  btn.disabled=true;
+  try{
+    const {corrected,blocked}=await fetchSpellFix(current);
+    btn.classList.remove('spell-pulse');
+    btn.classList.add('spell-flash');
+    setTimeout(()=>btn.classList.remove('spell-flash'),500);
+    if(corrected.trim()===current.trim()){
+      toast(blocked?'AI pasiūlymas atrodė per rizikingas — tekstas paliktas nepakeistas.':'Rašybos klaidų nerasta ✓');
+      btn.disabled=false;
+      return;
+    }
+    spellFix={key,original:current,corrected,status:'pending',manualEdit:false};
+    tc.innerHTML=spellDiffHtml(current,corrected);
+    tc.className='tr-text';
+    feedbackRow.classList.add('show');
+  }catch(e){
+    btn.classList.remove('spell-pulse');
+    toast(isNetworkError(e)?networkErrorPhrase():'Nepavyko ištaisyti rašybos — pabandykite dar kartą.');
+  }finally{
+    btn.disabled=false;
+  }
+}
+async function confirmSpellFix(){
+  if(!spellFix||spellFix.status!=='pending')return;
+  const upd=lang==='lt'?{transcript:spellFix.corrected,updatedAt:new Date().toISOString()}:{transcriptEn:spellFix.corrected,updatedAt:new Date().toISOString()};
+  await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
+  spellFix.status='confirmed';
+  document.getElementById('spell-feedback-row').classList.remove('show');
+  const tc=document.getElementById('d-tr');
+  tc.textContent=spellFix.corrected; // pašalina pabraukimus, tekstas dabar redaguojamas įprastai per "Redaguoti"
+  toast('Išsaugota ✓');
+}
+function rejectSpellFix(){
+  if(!spellFix)return;
+  const tc=document.getElementById('d-tr');
+  tc.textContent=spellFix.original;
+  document.getElementById('spell-feedback-row').classList.remove('show');
+  spellFix=null;
+}
+async function doUndoSpellFix(){
+  if(!spellFix)return;
+  const upd=lang==='lt'?{transcript:spellFix.original,updatedAt:new Date().toISOString()}:{transcriptEn:spellFix.original,updatedAt:new Date().toISOString()};
+  await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
+  const tc=document.getElementById('d-tr');
+  tc.textContent=spellFix.original;
+  spellFix.status='pending'; // leidžia iš karto perjungti atgal į AI versiją be naujo API kvietimo
+  spellFix.manualEdit=false;
+  toast('Grąžinta ✓');
+}
+function confirmUndoSpellFix(){
+  document.getElementById('spell-confirm-row').classList.remove('show');
+  doUndoSpellFix();
+}
+function cancelUndoSpellFix(){
+  document.getElementById('spell-confirm-row').classList.remove('show');
 }
 async function doSummarize(){
   // kept for manual retry via edit summary flow
