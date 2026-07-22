@@ -709,7 +709,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v48';
+const APP_VERSION='v49';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1153,7 +1153,7 @@ function goRecord(){
 //      (everything recorded so far is safe), and show a "resume" state instead of
 //      silently recording nothing.
 const IS_IOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
-let wakeLock=null,keepAliveAudio=null,muteTimer=null,muteStartedAt=0;
+let wakeLock=null,keepAliveAudio=null,muteTimer=null,muteStartedAt=0,lastDataTs=0,hiddenAt=0,lastTickWall=0;
 async function acquireWakeLock(){
   if(!('wakeLock' in navigator))return; // not supported (older browsers) — other layers still help
   try{
@@ -1181,11 +1181,17 @@ document.addEventListener('visibilitychange',()=>{
   // pranešimą ir ▶ mygtuką, o resumeAfterInterrupt() iš naujo paprašo mikrofono ir
   // perkuria AudioContext + analyser (todėl atgyja ir bangelės).
   //
-  // SVARBU: tik iOS. Android'e fone įrašymas veikia teisingai (patikrinta v46
-  // testuose — garsas iš fono laikotarpio patenka į įrašą), todėl ten pertraukimo
-  // fiksuoti NEGALIMA — be reikalo nutrauktume puikiai veikiantį įrašą.
+  // SVARBU: prievartinis pertraukimas 'hidden' momentu — tik iOS. Android'e fone
+  // įrašymas DAŽNAI veikia (Chrome laiko mikrofono sesiją su pranešimu), todėl ten
+  // iš anksto nutraukti negalima — sugadintume veikiantį scenarijų. BET v48 testas
+  // Galaxy Tab A8 parodė, kad kai kurie Android įrenginiai (OEM energijos taupymas)
+  // foną vis dėlto užmigdo: įrašymas "tęsiasi", o garso fone nėra. Kadangi iš anksto
+  // nežinome, kuriai grupei įrenginys priklauso, elgiamės pagal FAKTĄ: fiksuojame
+  // perėjimo į foną laiką, o grįžus tikriname, ar MediaRecorder visą tą laiką
+  // realiai teikė duomenis (žr. 'visible' šaką žemiau).
   if(document.visibilityState==='hidden'){
     if(IS_IOS&&rstate==='recording')interruptRec();
+    else if(rstate==='recording')hiddenAt=Date.now();
     return;
   }
   if(document.visibilityState==='visible'){
@@ -1196,6 +1202,24 @@ document.addEventListener('visibilitychange',()=>{
     if(IS_IOS&&rstate==='recording'){
       const t=ms&&ms.getAudioTracks&&ms.getAudioTracks()[0];
       if(!t||t.readyState!=='live'||t.muted)interruptRec();
+    }
+    // ── v49 (G-7): Android fono spragos aptikimas ─────────────────────────────────
+    // Priekyje MediaRecorder duoda gabaliukus kas ~100 ms (lastDataTs atsinaujina
+    // nuolat). Jei grįžus paaiškėja, kad nuo paskutinio gabaliuko praėjo daug realaus
+    // laiko — sistema buvo užmigdžiusi įrašymą, ir viskas, kas pasakyta fone,
+    // NEEGZISTUOJA. Toliau apsimetinėti, kad įrašinėjama, būtų melas (būtent taip v48
+    // teste "dingo" fone pasakyti žodžiai). Todėl elgiamės kaip iOS: užsklendžiame
+    // iki fono įrašytą dalį ir sąžiningai parodome pertraukimo būseną su ▶.
+    // Jei duomenys fone TEKĖJO (lastDataTs šviežias) — nieko nedarome: foninis
+    // įrašymas veikė ir toliau veikia, kaip v46 testuose.
+    if(!IS_IOS&&rstate==='recording'&&hiddenAt){
+      const stalled=Date.now()-lastDataTs>3000;
+      hiddenAt=0;
+      if(stalled){
+        interruptRec();
+        const h=document.getElementById('rhint');
+        if(h)h.textContent='Programa buvo fone ir tuo metu garsas nebuvo įrašomas — iki tol įrašyta dalis saugi. Palieskite ▶ tęsti.';
+      }
     }
   }
 });
@@ -1348,8 +1372,16 @@ async function resumeAfterInterrupt(){
 // and would grow one giant (potentially >6 MB) segment. Every path now uses this.
 function startTick(){
   clearInterval(tick);
+  // v49: rms auginamas pagal REALIAI praėjusį laiką, o ne fiksuotais +100 ms.
+  // Fone naršyklės setInterval "retina" iki 1 karto per sekundę ar rečiau — su
+  // senuoju +=100 laikmatis (ir galutinė durationMs) atsilikdavo nuo tikrovės
+  // 10 ir daugiau kartų. Su wall-clock delta laikas teisingas visais atvejais,
+  // įskaitant foninį įrašymą Android'e.
+  lastTickWall=Date.now();
   tick=setInterval(()=>{
-    rms+=100;document.getElementById('rtimer').textContent=ms2t(rms);
+    const now=Date.now();
+    rms+=now-lastTickWall;lastTickWall=now;
+    document.getElementById('rtimer').textContent=ms2t(rms);
     if(rstate==='recording'&&rms-lastSegStartRms>=SEGMENT_MS){lastSegStartRms=rms;rotateSegment();}
   },100);
 }
@@ -1396,7 +1428,8 @@ function startNewMediaRecorder(){
   }catch(e){
     mr=new MediaRecorder(ms);
   }
-  mr.ondataavailable=e=>{if(e.data.size>0)curChunks.push(e.data);};
+  mr.ondataavailable=e=>{if(e.data.size>0){curChunks.push(e.data);lastDataTs=Date.now();}}; // v49: lastDataTs — fono spragos aptikimui
+  lastDataTs=Date.now(); // v49: kad ką tik startavęs recorder'is nebūtų palaikytas "užstrigusiu"
   mr.start(100);
 }
 function rotateSegment(){
