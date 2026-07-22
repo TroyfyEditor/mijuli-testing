@@ -722,7 +722,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v52';
+const APP_VERSION='v53';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1237,6 +1237,8 @@ function goRecord(){
 //      silently recording nothing.
 const IS_IOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 let wakeLock=null,keepAliveAudio=null,muteTimer=null,muteStartedAt=0,lastDataTs=0,hiddenAt=0,lastTickWall=0;
+// v53 (G-7): mikrofono signalo stebėjimas — žr. sampleMicSignal()
+let micBuf=null,micTicks=0,lastSignalTs=0,signalAtHidden=0,ticksAtHidden=0,bgWarnTimer=null;
 async function acquireWakeLock(){
   if(!('wakeLock' in navigator))return; // not supported (older browsers) — other layers still help
   try{
@@ -1274,7 +1276,7 @@ document.addEventListener('visibilitychange',()=>{
   // realiai teikė duomenis (žr. 'visible' šaką žemiau).
   if(document.visibilityState==='hidden'){
     if(IS_IOS&&rstate==='recording')interruptRec();
-    else if(rstate==='recording')hiddenAt=Date.now();
+    else if(rstate==='recording'){hiddenAt=Date.now();signalAtHidden=lastSignalTs;ticksAtHidden=micTicks;}
     return;
   }
   if(document.visibilityState==='visible'){
@@ -1296,12 +1298,23 @@ document.addEventListener('visibilitychange',()=>{
     // Jei duomenys fone TEKĖJO (lastDataTs šviežias) — nieko nedarome: foninis
     // įrašymas veikė ir toliau veikia, kaip v46 testuose.
     if(!IS_IOS&&rstate==='recording'&&hiddenAt){
-      const stalled=Date.now()-lastDataTs>3000;
+      const bgMs=Date.now()-hiddenAt,ticks=micTicks-ticksAtHidden;
       hiddenAt=0;
-      if(stalled){
-        interruptRec();
-        const h=document.getElementById('rhint');
-        if(h)h.textContent='Programa buvo fone ir tuo metu garsas nebuvo įrašomas — iki tol įrašyta dalis saugi. Palieskite ▶ tęsti.';
+      // Spraga konstatuojama, jei per visą buvimą fone nė karto neužfiksuotas signalas
+      // (lastSignalTs nepajudėjo), ARBA jei taimeris fone išvis nesisuko ir stebėti
+      // nebuvo kaip — tokiu atveju beveik visada užmigdoma ir garso sesija.
+      const noSignal=lastSignalTs<=signalAtHidden,frozen=ticks<3;
+      if(bgMs>3000&&(noSignal||frozen)){
+        // Android'e įrašymas po grįžimo paprastai veikia toliau — nutraukti jį ir versti
+        // spausti ▶ būtų blogiau nei pasakyti tiesą. Todėl PRANEŠAMA, bet neužstabdoma.
+        toast('Programa buvo fone — tuo metu telefonas garso neįrašė. Įrašymas tęsiamas toliau.');
+        // Bet jei mikrofonas ir grįžus liko negyvas, tęsti nėra ko: palaukiame, ar
+        // signalas atsinaujina, ir tik tada fiksuojame tikrą pertraukimą.
+        const mark=Date.now();
+        clearTimeout(bgWarnTimer);
+        bgWarnTimer=setTimeout(()=>{
+          if(rstate==='recording'&&lastSignalTs<mark)interruptRec();
+        },1800);
       }
     }
   }
@@ -1464,9 +1477,34 @@ function startTick(){
   tick=setInterval(()=>{
     const now=Date.now();
     rms+=now-lastTickWall;lastTickWall=now;
+    sampleMicSignal(); // v53 (G-7)
     document.getElementById('rtimer').textContent=ms2t(rms);
     if(rstate==='recording'&&rms-lastSegStartRms>=SEGMENT_MS){lastSegStartRms=rms;rotateSegment();}
   },100);
+}
+// ── v53 (G-7): ar mikrofonas apskritai gyvas ──────────────────────────────────
+// v49 spraga buvo aptinkama pagal tai, ar MediaRecorder teikia duomenų gabaliukus.
+// Paaiškėjo, kad Chrome fone gabaliukus siunčia toliau — tik jie TUŠTI. Todėl
+// sąlyga "duomenys nustojo tekėti" niekada nesuveikdavo, nors garso ir nebūdavo.
+//
+// Dabar tikrinamas pats signalas: kai garso sesija gyva, mikrofonas visada duoda
+// bent menkiausią svyravimą apie vidurio liniją (128) — net visiškoje tyloje yra
+// triukšmo dugnas. Kai sistema sesiją užmigdo, analyser'is grąžina IDEALIAI plokščią
+// liniją: visos reikšmės lygiai 128, be jokio nuokrypio. Tai patikimas skirtumas
+// tarp "tylu" ir "mikrofono nebėra".
+//
+// Matuojama tick'e (setInterval), o ne piešimo cikle (requestAnimationFrame), nes
+// pastarasis fone visai nesukamas — būtent todėl bangelės ir sustingdavo.
+function sampleMicSignal(){
+  if(!analyser)return;
+  try{
+    if(!micBuf||micBuf.length!==analyser.fftSize)micBuf=new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(micBuf);
+    let dev=0;
+    for(let i=0;i<micBuf.length;i++){const d=micBuf[i]-128,a=d<0?-d:d;if(a>dev)dev=a;}
+    micTicks++;
+    if(dev>0)lastSignalTs=Date.now();
+  }catch(e){}
 }
 async function toggleRec(){
   if(rstate!=='idle')return;
