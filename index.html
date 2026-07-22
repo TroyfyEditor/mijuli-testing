@@ -709,7 +709,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v47';
+const APP_VERSION='v48';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -732,7 +732,7 @@ let mr=null,ms=null,chunks=[],tick=null,rms=0,rstate='idle';
 // Buffer.from(base64,'base64')) to run out of memory and crash the whole execution.
 const SEGMENT_MS=4*60*1000;
 let segments=[],curChunks=[],lastSegStartRms=0;
-let analyser=null,af=null;
+let analyser=null,af=null,audioCtx=null;
 let ael=null,playing=false;
 let allRecs=[];
 
@@ -1268,10 +1268,17 @@ function interruptRec(){
   // everything up to the call is saveable.
   try{
     const oldMr=mr;
+    // v48 (G-1b): senojo MediaRecorder gabaliukus nukreipiame į ATSKIRĄ buferį, o
+    // curChunks atlaisviname naujam įrašymui. Be to sena `stop()` sukelta paskutinė
+    // 'dataavailable' porcija (iOS ji gali ateiti tik po to, kai puslapis atsibunda)
+    // patektų į jau prasidėjusio naujo segmento gabaliukus ir juos suveltų.
+    const buf=curChunks;
+    curChunks=[];
+    if(oldMr)oldMr.ondataavailable=e=>{if(e.data.size>0)buf.push(e.data);};
     oldMr.onstop=()=>{
-      if(curChunks.length){
-        const seg=new Blob(curChunks,{type:oldMr.mimeType||'audio/webm'});
-        segments.push(seg);curChunks=[];
+      if(buf.length){
+        const seg=new Blob(buf,{type:oldMr.mimeType||'audio/webm'});
+        segments.push(seg);
         queueLiveTranscription(segments.length-1,seg); // sealed part is final — start now
       }
     };
@@ -1285,18 +1292,37 @@ function interruptRec(){
 }
 async function resumeAfterInterrupt(){
   if(rstate!=='interrupted')return;
+  // ── v48 (G-1b) ───────────────────────────────────────────────────────────────
+  // AudioContext kuriamas SINCHRONIŠKAI — dar nepradėjus jokio await. Taip išsaugomas
+  // mygtuko paspaudimo "user gesture" leidimas; sukurtas po await, iOS jį palieka
+  // "suspended" būsenoje ir bangelės lieka sustingusios (ta pati priežastis aprašyta
+  // toggleRec komentare). Senas kontekstas uždaromas — iOS Safari leidžia turėti tik
+  // kelis AudioContext vienu metu, todėl po kelių pertraukimų naujo sukurti nepavyktų.
+  let ctx=null;
   try{
-    const track=ms&&ms.getAudioTracks&&ms.getAudioTracks()[0];
-    if(!track||track.readyState==='ended'||track.muted){
-      // The old stream is dead — request the microphone anew and rebuild the
-      // analyser on top of the fresh stream so the waveform comes back to life too.
-      try{ms&&ms.getTracks().forEach(t=>t.stop());}catch(e){}
-      ms=await navigator.mediaDevices.getUserMedia({audio:true});
-      attachTrackWatch();
-      const ctx=new AudioContext();
+    if(audioCtx){try{audioCtx.close();}catch(e){}audioCtx=null;}
+    ctx=new AudioContext();
+    if(ctx.state==='suspended')ctx.resume().catch(()=>{});
+  }catch(e){ctx=null;}
+  try{
+    // v48 (G-1b): mikrofono srautas atkuriamas VISADA.
+    // v47 tai buvo daroma tik jei track atrodė "miręs" (!track || ended || muted). Bet
+    // iOS po ekrano užrakinimo palieka track FORMALIAI GYVĄ (readyState==='live',
+    // muted===false), nors garso sesija jau sunaikinta. Todėl sąlyga negaliodavo,
+    // atkūrimas būdavo praleidžiamas, ir liktas senas negyvas `ms` reiškė:
+    //   • naujas MediaRecorder negauna jokių duomenų → įrašas po "tęsti" neišsisaugo;
+    //   • analyser lieka prikabintas prie sustabdyto AudioContext → bangelės nejuda.
+    // Abu simptomai tiksliai atitiko v47 testą. Sąlygos atsisakome: naujo getUserMedia
+    // kaina yra kelios milisekundės, o klaidingas "gyvo" srauto vertinimas kainuoja
+    // visą likusį įrašą.
+    try{ms&&ms.getTracks().forEach(t=>t.stop());}catch(e){}
+    ms=await navigator.mediaDevices.getUserMedia({audio:true});
+    attachTrackWatch();
+    if(ctx){
       if(ctx.state==='suspended'){try{await ctx.resume();}catch(e){}}
       analyser=ctx.createAnalyser();analyser.fftSize=64;
       ctx.createMediaStreamSource(ms).connect(analyser);
+      audioCtx=ctx;
     }
     // The interruption sealed a segment at time `rms`, so the rotation clock restarts
     // from here — the next rotation happens SEGMENT_MS from now, not from the old mark.
@@ -1336,6 +1362,7 @@ async function toggleRec(){
     document.getElementById('rhint').style.display='block';
     ms=await navigator.mediaDevices.getUserMedia({audio:true});
     chunks=[];
+    if(audioCtx){try{audioCtx.close();}catch(e){}audioCtx=null;} // v48: neleidžiam kauptis kontekstams
     const ctx=new AudioContext();
     // iOS Safari kartais palieka AudioContext "suspended" būsenoje, jei jis sukuriamas
     // po asinchroninio laukimo (await) — net jei toggleRec() buvo iškviesta tiesiogiai
@@ -1344,6 +1371,7 @@ async function toggleRec(){
     if(ctx.state==='suspended'){try{await ctx.resume();}catch(e){}}
     analyser=ctx.createAnalyser();analyser.fftSize=64;
     ctx.createMediaStreamSource(ms).connect(analyser);
+    audioCtx=ctx; // v48: kad vėliau galėtume korektiškai uždaryti
     startWave();
     rstate='recording';rms=0;lastSegStartRms=0;segments=[];liveTr=[];
     startNewMediaRecorder();
@@ -1587,6 +1615,8 @@ function cancelRecord(){
   stopRecordingGuards();
   if(mr&&mr.state!=='inactive')mr.stop();
   ms&&ms.getTracks().forEach(t=>t.stop());
+  if(audioCtx){try{audioCtx.close();}catch(e){}audioCtx=null;} // v48
+  analyser=null;
   mr=null;ms=null;rstate='idle';chunks=[];segments=[];curChunks=[];liveTr=[];
   document.getElementById('rec-title-input').value='';
   goHome();
