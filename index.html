@@ -722,7 +722,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v53';
+const APP_VERSION='v54';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1238,7 +1238,7 @@ function goRecord(){
 const IS_IOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 let wakeLock=null,keepAliveAudio=null,muteTimer=null,muteStartedAt=0,lastDataTs=0,hiddenAt=0,lastTickWall=0;
 // v53 (G-7): mikrofono signalo stebėjimas — žr. sampleMicSignal()
-let micBuf=null,micTicks=0,lastSignalTs=0,signalAtHidden=0,ticksAtHidden=0,bgWarnTimer=null;
+let micBuf=null,micPrev=null,micPrevOk=false,micTicks=0,lastSignalTs=0,ticksAtHidden=0,bgWarnTimer=null;
 async function acquireWakeLock(){
   if(!('wakeLock' in navigator))return; // not supported (older browsers) — other layers still help
   try{
@@ -1276,7 +1276,7 @@ document.addEventListener('visibilitychange',()=>{
   // realiai teikė duomenis (žr. 'visible' šaką žemiau).
   if(document.visibilityState==='hidden'){
     if(IS_IOS&&rstate==='recording')interruptRec();
-    else if(rstate==='recording'){hiddenAt=Date.now();signalAtHidden=lastSignalTs;ticksAtHidden=micTicks;}
+    else if(rstate==='recording'){hiddenAt=Date.now();ticksAtHidden=micTicks;}
     return;
   }
   if(document.visibilityState==='visible'){
@@ -1300,10 +1300,10 @@ document.addEventListener('visibilitychange',()=>{
     if(!IS_IOS&&rstate==='recording'&&hiddenAt){
       const bgMs=Date.now()-hiddenAt,ticks=micTicks-ticksAtHidden;
       hiddenAt=0;
-      // Spraga konstatuojama, jei per visą buvimą fone nė karto neužfiksuotas signalas
-      // (lastSignalTs nepajudėjo), ARBA jei taimeris fone išvis nesisuko ir stebėti
-      // nebuvo kaip — tokiu atveju beveik visada užmigdoma ir garso sesija.
-      const noSignal=lastSignalTs<=signalAtHidden,frozen=ticks<3;
+      // v54: žiūrima, KADA paskutinį kartą matytas gyvas signalas. Ankstesnis variantas
+      // lygino su momentu prieš foną, todėl vieno vienintelio virptelėjimo pačioje
+      // užmigdymo pradžioje (perėjimo momentu) pakakdavo, kad spraga liktų nepastebėta.
+      const noSignal=Date.now()-lastSignalTs>3000,frozen=ticks<3;
       if(bgMs>3000&&(noSignal||frozen)){
         // Android'e įrašymas po grįžimo paprastai veikia toliau — nutraukti jį ir versti
         // spausti ▶ būtų blogiau nei pasakyti tiesą. Todėl PRANEŠAMA, bet neužstabdoma.
@@ -1498,12 +1498,21 @@ function startTick(){
 function sampleMicSignal(){
   if(!analyser)return;
   try{
-    if(!micBuf||micBuf.length!==analyser.fftSize)micBuf=new Uint8Array(analyser.fftSize);
+    const n=analyser.fftSize;
+    if(!micBuf||micBuf.length!==n){micBuf=new Uint8Array(n);micPrev=new Uint8Array(n);micPrevOk=false;}
     analyser.getByteTimeDomainData(micBuf);
-    let dev=0;
-    for(let i=0;i<micBuf.length;i++){const d=micBuf[i]-128,a=d<0?-d:d;if(a>dev)dev=a;}
     micTicks++;
-    if(dev>0)lastSignalTs=Date.now();
+    // v54: požymis — ar buferis KEIČIASI, o ne ar jis nelygus nuliui.
+    // v53 tikrino nuokrypį nuo vidurio linijos (128) manant, kad mirusi sesija duos
+    // idealiai plokščią liniją. Testas parodė, kad taip nėra: užmigdyta sesija palieka
+    // ĮSTRIGUSĮ paskutinį buferį, kurio nuokrypis >0, todėl mirtis atrodydavo kaip
+    // gyvas signalas. Gyvas mikrofonas praktiškai niekada neduoda dviejų identiškų
+    // buferių iš eilės (visada yra bent triukšmo dugno virptelėjimas), o įstrigęs
+    // duoda tik tokius — todėl kitimas yra daug patikimesnis gyvybės ženklas.
+    let changed=!micPrevOk;
+    if(!changed)for(let i=0;i<n;i++){if(micBuf[i]!==micPrev[i]){changed=true;break;}}
+    micPrev.set(micBuf);micPrevOk=true;
+    if(changed)lastSignalTs=Date.now();
   }catch(e){}
 }
 async function toggleRec(){
