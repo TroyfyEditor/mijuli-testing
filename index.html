@@ -709,7 +709,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v49';
+const APP_VERSION='v50';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1799,7 +1799,7 @@ async function autoTranscribe(segmentsBlobs,dur,customTitle,liveResults){
     return;
   }
   recId=id;lang='lt';
-  loadAudioSegments(segmentsBlobs);
+  loadAudioSegments(segmentsBlobs,dur); // v50: dur — atsarginis trukmės šaltinis
   // 2) Now attempt transcription. If it fails, the recording still exists — just show
   //    the error and let the person open it and retry via the "Konvertuoti į tekstą" button.
   try{
@@ -1916,9 +1916,9 @@ async function openDetail(id){
     }
     if(recId!==id)return;
     if(segs&&segs.length>1){
-      loadAudioSegments(segs);
+      loadAudioSegments(segs,cached?.durationMs);
     }else if(blob){
-      loadAudioBlob(blob);
+      loadAudioBlob(blob,cached?.durationMs);
     }else{
       document.getElementById('p-time').textContent='Garso įrašo nėra šiame įrenginyje';
     }
@@ -1945,6 +1945,7 @@ function renderDetail(rec){
   document.getElementById('d-title-disp').textContent=rec.title||'Be pavadinimo';
   document.getElementById('d-date').textContent=new Date(rec.createdAt).toLocaleString('lt-LT',{weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
   document.getElementById('d-dur').textContent=ms2t(rec.durationMs||0);
+  setAudioFallbackTotal(rec.durationMs); // v50: tiksli trukmė iš Firestore grotuvui
   // transcript
   const tr=lang==='lt'?rec.transcript:rec.transcriptEn;
   const tc=document.getElementById('d-tr');
@@ -2344,12 +2345,77 @@ async function restoreRecording(id){
 // through a single <audio> element, swapping its source at each boundary, while
 // presenting one continuous timeline (seek bar, timer) to the user.
 let aSegUrls=[],aSegDurations=[],aSegIndex=0,aInitialized=false;
-function loadAudioURL(url){loadAudioSegments([url]);}
-function loadAudioBlob(blob){loadAudioSegments(blob?[blob]:[]);}
-function loadAudioSegments(blobs){
+// ── v50 (G-2) ─────────────────────────────────────────────────────────────────
+// Chrome (Android) MediaRecorder sukuria webm failą BE trukmės metaduomenų — tokio
+// failo audio.duration grąžina Infinity. Anksčiau tokiu atveju segmento trukmė buvo
+// paverčiama į 0, todėl grotuvas rodė bendrą trukmę 0:00, o persukimas (juostos
+// paspaudimas ir −5s/+5s) neveikdavo visai: seekP() iškart grįždavo, nes
+// totalDuration() buvo 0. iPhone įrašai (mp4) trukmę turi, todėl jiems veikė.
+//
+// Sprendimas dviem sluoksniais:
+//  1) "Infinity triukas" — peršokus į labai tolimą poziciją naršyklė perskaito failą
+//     iki galo ir duration tampa tikslus (atsiunčia durationchange). Veikia Chrome
+//     webm atveju ir yra tikslus iki milisekundžių.
+//  2) Jei ir tai nepavyksta (senas failas, klaida) — trukmė paskirstoma iš įrašo
+//     bendros durationMs, saugomos Firestore. Nebūtinai tobula, bet grotuvas veikia.
+let aFallbackMs=0,aLoadToken=0;
+function probeDuration(url){
+  return new Promise(resolve=>{
+    const a=new Audio();
+    let done=false,timer=null;
+    const finish=v=>{
+      if(done)return;done=true;clearTimeout(timer);
+      try{a.ondurationchange=a.onloadedmetadata=a.onerror=null;a.src='';}catch(e){}
+      resolve(isFinite(v)&&v>0?v:0);
+    };
+    timer=setTimeout(()=>finish(0),8000); // niekada nepakabiname grotuvo įkėlimo
+    a.preload='metadata';
+    a.onerror=()=>finish(0);
+    a.onloadedmetadata=()=>{
+      if(isFinite(a.duration)&&a.duration>0)return finish(a.duration);
+      // duration===Infinity → priverčiame naršyklę perskaityti failą iki galo
+      a.ondurationchange=()=>{if(isFinite(a.duration)&&a.duration>0)finish(a.duration);};
+      try{a.currentTime=1e7;}catch(e){finish(0);}
+    };
+    a.src=url;
+  });
+}
+// Paskirsto trūkstamas segmentų trukmes iš žinomos bendros įrašo trukmės.
+function applyDurationFallback(){
+  if(!aSegDurations.length||aFallbackMs<=0)return;
+  const missing=[];
+  let known=0;
+  aSegDurations.forEach((d,i)=>{d>0?known+=d:missing.push(i);});
+  if(!missing.length)return;
+  const rest=Math.max(0,aFallbackMs/1000-known);
+  const per=rest/missing.length;
+  if(per>0)missing.forEach(i=>{aSegDurations[i]=per;});
+}
+// Iškviečiama, kai iš Firestore gaunama tiksli įrašo trukmė (renderDetail) — garsas
+// ir dokumentas atkeliauja nepriklausomai, todėl atsargiai apdorojame abi eiliškumo
+// galimybes.
+function setAudioFallbackTotal(ms){
+  aFallbackMs=ms||0;
+  if(ael&&aSegDurations.length&&aSegDurations.some(d=>!d)){applyDurationFallback();updP();}
+}
+async function resolveSegmentDurations(token){
+  const urls=aSegUrls.slice();
+  const results=await Promise.all(urls.map(u=>probeDuration(u)));
+  if(token!==aLoadToken)return; // tuo tarpu atidarytas kitas įrašas
+  results.forEach((d,i)=>{if(d>0)aSegDurations[i]=d;});
+  applyDurationFallback();
+  updP();
+}
+function loadAudioURL(url,totalMs){loadAudioSegments([url],totalMs);}
+function loadAudioBlob(blob,totalMs){loadAudioSegments(blob?[blob]:[],totalMs);}
+function loadAudioSegments(blobs,totalMs){
   unloadAudio();
   blobs=(blobs||[]).filter(Boolean);
+  // v50: atsarginė trukmė visada perrašoma (o ne paliekama iš anksčiau atidaryto
+  // įrašo) — kitaip svetima durationMs galėtų būti pritaikyta šio įrašo segmentams.
+  aFallbackMs=(typeof totalMs==='number'&&totalMs>0)?totalMs:0;
   if(!blobs.length)return;
+  const token=++aLoadToken;
   aSegUrls=blobs.map(b=>typeof b==='string'?b:URL.createObjectURL(b));
   aSegDurations=new Array(aSegUrls.length).fill(0);
   aSegIndex=0;aInitialized=false;
@@ -2362,25 +2428,18 @@ function loadAudioSegments(blobs){
       aInitialized=true;
       document.getElementById('p-play').disabled=false;
       document.getElementById('p-stop').disabled=false;
-      if(aSegUrls.length>1)preloadSegmentDurations();
+      // v50: visų segmentų (įskaitant pirmąjį) trukmės nustatomos atskirais probe
+      // elementais — pats ael lieka tik grojimui, kad Infinity triuko currentTime
+      // šuolis netrikdytų klausymo.
+      resolveSegmentDurations(token);
     }
     updP();
   };
   ael.onended=()=>advanceSegment();
 }
-// Quietly probes each remaining segment's duration up front (throwaway Audio elements)
-// so the seek bar shows the correct TOTAL length immediately, rather than only growing
-// as playback reaches each new segment.
-function preloadSegmentDurations(){
-  const remaining=aSegUrls.length-1;
-  let done=0;
-  for(let i=1;i<aSegUrls.length;i++){
-    const probe=new Audio(aSegUrls[i]);
-    const settle=()=>{done++;if(done===remaining)updP();};
-    probe.onloadedmetadata=()=>{aSegDurations[i]=(probe.duration&&isFinite(probe.duration))?probe.duration:0;settle();};
-    probe.onerror=settle;
-  }
-}
+// v50: preloadSegmentDurations() pakeista resolveSegmentDurations() — ji tikrina
+// VISUS segmentus (ne tik nuo antrojo) ir moka apdoroti webm failus be trukmės
+// metaduomenų, todėl juostos bendra trukmė teisinga iškart, dar nepradėjus groti.
 function advanceSegment(){
   if(!ael)return;
   if(aSegIndex<aSegUrls.length-1){
@@ -2423,6 +2482,7 @@ function unloadAudio(){
   if(ael){ael.pause();ael.onended=null;ael.ontimeupdate=null;ael.onloadedmetadata=null;ael.src='';ael=null;}
   aSegUrls.forEach(u=>{if(u&&u.startsWith('blob:'))URL.revokeObjectURL(u);});
   aSegUrls=[];aSegDurations=[];aSegIndex=0;aInitialized=false;playing=false;
+  aLoadToken++; // v50: nutraukiam dar nebaigtus trukmių matavimus
   const pp=document.getElementById('p-play'),ps=document.getElementById('p-stop'),pt=document.getElementById('p-time'),pf=document.getElementById('p-fill');
   if(pp){pp.disabled=true;const i=document.getElementById('p-ico');if(i)i.innerHTML='<polygon points="5 3 19 12 5 21 5 3"/>';}
   if(ps)ps.disabled=true;
