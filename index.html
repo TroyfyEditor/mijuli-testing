@@ -70,6 +70,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 .afield label{display:block;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
 .afield input{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:13px 16px;font-size:15px;color:var(--white);outline:none;font-family:inherit}
 .afield input:focus{border-color:var(--blue)}
+/* v52: slaptažodžio peržiūros ("akies") mygtukas lauko viduje */
+.pass-wrap{position:relative;display:block}
+.pass-wrap input{padding-right:48px}
+.pass-peek{position:absolute;right:5px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;padding:9px;display:flex;align-items:center;justify-content:center;border-radius:10px;font-family:inherit}
+.pass-peek:active{opacity:.55}
+.pass-peek.on{color:var(--blue)}
 .auth-err{font-size:13px;color:var(--red);min-height:18px;margin-bottom:10px;text-align:center}
 .btn-auth{width:100%;background:var(--blue);border:none;border-radius:14px;padding:16px;font-size:16px;font-weight:600;color:#fff;cursor:pointer;font-family:inherit}
 .btn-google{width:100%;background:#fff;border:1px solid var(--border);border-radius:14px;padding:14px;font-size:15px;font-weight:600;color:#1f1f1f;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:18px}
@@ -355,7 +361,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
     <div class="auth-divider"><span>arba</span></div>
     <div class="afield"><label>Slapyvardis</label><input type="text" id="a-nick" placeholder="" autocomplete="username"/></div>
     <div class="afield" id="a-email-wrap" style="display:none"><label>El. paštas</label><input type="email" id="a-email" placeholder=""/></div>
-    <div class="afield"><label>Slaptažodis</label><input type="password" id="a-pass" placeholder="••••••••"/></div>
+    <div class="afield"><label>Slaptažodis</label>
+      <div class="pass-wrap">
+        <input type="password" id="a-pass" placeholder="••••••••"/>
+        <button type="button" class="pass-peek" id="a-pass-peek" onclick="peekPassword()" title="Parodyti slaptažodį" aria-label="Parodyti slaptažodį">
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+      </div>
+    </div>
     <div class="auth-err" id="a-err"></div>
     <button class="btn-auth" id="btn-auth-do" onclick="doAuth()">Prisijungti</button>
     <button class="btn-forgot" onclick="doForgotPassword()">Pamiršau slaptažodį</button>
@@ -709,7 +722,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v51';
+const APP_VERSION='v52';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -746,12 +759,19 @@ auth.onAuthStateChanged(async u=>{
       // First-ever sign-in (e.g. via Google) — no profile doc yet, create one.
       // Auto-generate a nickname from the Google display name / email; the person
       // can change it later in Account settings.
-      const base=(u.displayName||u.email.split('@')[0]||'naudotojas').toLowerCase().replace(/[^a-z0-9]+/g,'');
-      let autoNick=base||'naudotojas';
-      // Avoid nickname collisions
+      // v52: automatinis slapyvardis taip pat privalo atitikti taisykles (3–12 simbolių,
+      // tik raidės/skaičiai/-/_), kitaip žmogus gautų slapyvardį, kurio pats nebegalėtų
+      // išsaugoti keisdamas jį Paskyroje.
+      let base=(u.displayName||u.email.split('@')[0]||'naudotojas').toLowerCase().replace(/[^a-z0-9_-]+/g,'');
+      if(base.length<NICK_MIN)base='naudotojas';
+      let autoNick=base.slice(0,NICK_MAX);
+      // Avoid nickname collisions (priesaga pridedama neperžengiant ilgio ribos)
       try{
         const clash=await db.collection('users').where('nickname','==',autoNick).limit(1).get();
-        if(!clash.empty)autoNick=autoNick+Math.floor(Math.random()*1000);
+        if(!clash.empty){
+          const sfx=String(Math.floor(Math.random()*1000));
+          autoNick=base.slice(0,NICK_MAX-sfx.length)+sfx;
+        }
       }catch(e){}
       await db.collection('users').doc(u.uid).set({nickname:autoNick,email:u.email,createdAt:new Date().toISOString()});
       s=await db.collection('users').doc(u.uid).get();
@@ -810,6 +830,7 @@ function switchAuth(m){
   document.getElementById('btn-auth-do').textContent=m==='login'?'Prisijungti':'Sukurti paskyrą';
   document.querySelector('.btn-forgot').style.display=m==='login'?'block':'none';
   document.getElementById('a-err').textContent='';
+  hidePassword(); // v52: perjungus režimą slaptažodis niekada nelieka matomas
 }
 function translateAuthError(e){
   const map={
@@ -825,29 +846,87 @@ function translateAuthError(e){
   };
   return map[e.code]||e.message.replace('Firebase: ','').replace(/\(auth[^)]*\)/,'').trim();
 }
+// ── v52: slaptažodžio peržiūra ir įvedimo taisyklės ──────────────────────────
+// Slaptažodis parodomas trumpam ir vėl paslepiamas savaime. Taip žmogus gali
+// pasitikrinti, ką įvedė, bet slaptažodis nelieka atviras ekrane, jei telefonas
+// būtų padėtas ar kas nors pažvelgtų per petį.
+const PASSWORD_PEEK_MS=1000; // rodymo trukmė — keisti čia, jei pasirodytų per trumpa
+let passPeekTimer=null;
+function peekPassword(){
+  const inp=document.getElementById('a-pass'),btn=document.getElementById('a-pass-peek');
+  if(!inp)return;
+  clearTimeout(passPeekTimer);
+  inp.type='text';
+  if(btn)btn.classList.add('on');
+  passPeekTimer=setTimeout(()=>hidePassword(),PASSWORD_PEEK_MS);
+}
+function hidePassword(){
+  const inp=document.getElementById('a-pass'),btn=document.getElementById('a-pass-peek');
+  clearTimeout(passPeekTimer);passPeekTimer=null;
+  if(inp)inp.type='password';
+  if(btn)btn.classList.remove('on');
+}
+const NICK_MIN=3,NICK_MAX=12,PASS_MIN=6;
+// Leidžiamos tik ASCII raidės, skaičiai ir du skirtukai. Lietuviškos raidės sąmoningai
+// neįtrauktos: slapyvardis naudojamas prisijungimui, o rašant jį svetimu ar kitos kalbos
+// klaviatūra "ą/č/ę" įvesti dažnai neįmanoma — žmogus liktų užrakintas už savo paskyros.
+const NICK_RE=/^[a-z0-9_-]+$/;
+function normalizeNick(v){return (v||'').trim().toLowerCase();}
+function validateNick(n){
+  if(n.length<NICK_MIN)return `Slapyvardis turi būti bent ${NICK_MIN} simbolių.`;
+  if(n.length>NICK_MAX)return `Slapyvardis negali būti ilgesnis nei ${NICK_MAX} simboliai.`;
+  if(!NICK_RE.test(n))return 'Slapyvardyje galimos tik raidės, skaičiai, brūkšnelis (-) ir apatinis brūkšnys (_).';
+  return null;
+}
+function validatePassword(p){
+  if((p||'').length<PASS_MIN)return `Slaptažodis turi būti bent ${PASS_MIN} simbolių.`;
+  return null;
+}
 async function doAuth(){
-  const n=document.getElementById('a-nick').value.trim();
+  const nRaw=document.getElementById('a-nick').value.trim();
   const p=document.getElementById('a-pass').value;
   const btn=document.getElementById('btn-auth-do');
-  if(!n||!p){setErr('Užpildykite visus laukus.');return;}
+  if(!nRaw||!p){setErr('Užpildykite visus laukus.');return;}
+  const restore=()=>{btn.disabled=false;btn.textContent=amode==='login'?'Prisijungti':'Sukurti paskyrą';};
+  // Taisyklės tikrinamos TIK registruojantis. Prisijungiant jų taikyti negalima —
+  // anksčiau sukurtos paskyros gali turėti naujų taisyklių neatitinkantį slapyvardį,
+  // ir tokie žmonės nebegalėtų prisijungti prie savo paskyros.
+  if(amode==='register'){
+    const n=normalizeNick(nRaw);
+    const err=validateNick(n)||validatePassword(p);
+    if(err){setErr(err);return;}
+  }
   btn.disabled=true;btn.innerHTML='<span class="spin"></span>';
   try{
     if(amode==='register'){
+      const n=normalizeNick(nRaw);
       const e=document.getElementById('a-email').value.trim();
-      if(!e){setErr('Įveskite el. paštą.');btn.disabled=false;btn.textContent='Sukurti paskyrą';return;}
+      if(!e){setErr('Įveskite el. paštą.');restore();return;}
+      // Slapyvardžio unikalumas tikrinamas PRIEŠ kuriant paskyrą. Anksčiau to nebuvo:
+      // du žmonės galėjo užsiregistruoti tuo pačiu slapyvardžiu, o prisijungimo paieška
+      // (limit 1) visada rasdavo pirmąjį — antrasis nebūtų galėjęs prisijungti niekada.
+      const taken=await db.collection('users').where('nickname','==',n).limit(1).get();
+      if(!taken.empty){setErr('Šis slapyvardis jau užimtas.');restore();return;}
       const cr=await auth.createUserWithEmailAndPassword(e,p);
       await db.collection('users').doc(cr.user.uid).set({nickname:n,email:e,createdAt:new Date().toISOString()});
       // Best-effort: don't block account creation if sending the verification email fails
       // (e.g. transient network issue) — the person can always resend it later from Account.
       try{await cr.user.sendEmailVerification();}catch(err){console.warn('Verification email failed:',err);}
     }else{
-      const q=await db.collection('users').where('nickname','==',n).limit(1).get();
-      if(q.empty){setErr('Neteisingas slapyvardis arba slaptažodis.');btn.disabled=false;btn.textContent='Prisijungti';return;}
+      // Ieškome tiksliai taip, kaip įvesta (senos paskyros galėjo būti sukurtos su
+      // didžiosiomis raidėmis), o nepavykus — normalizuoto varianto. Taip veikia ir
+      // senos, ir naujos paskyros, nepriklausomai nuo to, kaip žmogus įrašė.
+      let q=await db.collection('users').where('nickname','==',nRaw).limit(1).get();
+      if(q.empty){
+        const alt=normalizeNick(nRaw);
+        if(alt!==nRaw)q=await db.collection('users').where('nickname','==',alt).limit(1).get();
+      }
+      if(q.empty){setErr('Neteisingas slapyvardis arba slaptažodis.');restore();return;}
       await auth.signInWithEmailAndPassword(q.docs[0].data().email,p);
     }
   }catch(e){
     setErr(translateAuthError(e));
-    btn.disabled=false;btn.textContent=amode==='login'?'Prisijungti':'Sukurti paskyrą';
+    restore();
   }
 }
 function setErr(m){document.getElementById('a-err').textContent=m;}
@@ -899,8 +978,12 @@ async function editVocabulary(){
 }
 async function editNickname(){
   openModal('Redaguoti slapyvardį',nick,async(val)=>{
-    const newNick=(val||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'');
+    // v52: anksčiau neleistini simboliai buvo tyliai išmetami — žmogus įvesdavo
+    // "Jonas_9!", o gaudavo "jonas9" nesuprasdamas kodėl. Dabar pasakoma, kas negerai.
+    const newNick=normalizeNick(val);
     if(!newNick||newNick===nick)return;
+    const err=validateNick(newNick);
+    if(err){toast(err);return;}
     const clash=await db.collection('users').where('nickname','==',newNick).limit(1).get();
     if(!clash.empty&&clash.docs[0].id!==user.uid){toast('Šis slapyvardis jau užimtas.');return;}
     await db.collection('users').doc(user.uid).update({nickname:newNick});
@@ -1714,10 +1797,10 @@ async function trackUsage(minutesDelta,summariesDelta){
 // Retries a single segment's transcription a couple of times before giving up — this
 // smooths over brief, transient connectivity blips (e.g. a phone switching from WiFi to
 // cellular mid-recording) that would otherwise fail the whole long transcription outright.
-async function transcribeBlobWithRetry(blob,maxAttempts=3){
+async function transcribeBlobWithRetry(blob,maxAttempts=3,opts){
   let lastErr;
   for(let i=0;i<maxAttempts;i++){
-    try{return await transcribeBlob(blob);}
+    try{return await transcribeBlob(blob,opts);}
     catch(e){
       lastErr=e;
       if(e.message==='Tuščias tekstas'||e.noRetry)throw e; // not a connectivity issue — no point retrying
@@ -1731,8 +1814,8 @@ async function transcribeBlobWithRetry(blob,maxAttempts=3){
 // live attempt already succeeded — if so, its text is used instantly with no network
 // call; if it failed or never ran (e.g. offline at the time), the segment is
 // transcribed here exactly as before. Order is preserved by index either way.
-async function transcribeSegments(segmentsBlobs,liveResults){
-  if(segmentsBlobs.length===1&&!(liveResults&&liveResults[0]))return transcribeBlob(segmentsBlobs[0]);
+async function transcribeSegments(segmentsBlobs,liveResults,opts){
+  if(segmentsBlobs.length===1&&!(liveResults&&liveResults[0]))return transcribeBlob(segmentsBlobs[0],opts);
   const estEl=document.getElementById('tr-estimate');
   const parts=[];
   for(let i=0;i<segmentsBlobs.length;i++){
@@ -1744,7 +1827,7 @@ async function transcribeSegments(segmentsBlobs,liveResults){
     }
     if(text===null){
       try{
-        text=await transcribeBlobWithRetry(segmentsBlobs[i]);
+        text=await transcribeBlobWithRetry(segmentsBlobs[i],3,opts);
       }catch(e){
         if(e.message==='Tuščias tekstas')continue;
         throw e;
@@ -2667,12 +2750,15 @@ async function isSilentBlob(blob){
   }
 }
 const TRANSCRIBE_WEBHOOK_URL='https://julija.app.n8n.cloud/webhook/b91f4e27-3c6a-4a58-9d2e-64c07a8f15db';
-async function transcribeBlob(blob){
+async function transcribeBlob(blob,opts){
   assertOnline();
   // v51 (G-4): tylaus gabalėlio nesiunčiame. 'Tuščias tekstas' yra jau visiškai
   // apdorota baigtis: transcribeBlobWithRetry jos nekartoja, transcribeSegments tokį
   // segmentą praleidžia, o jei tylūs visi — parodomas įprastas "Įraše nėra teksto".
-  if(await isSilentBlob(blob))throw new Error('Tuščias tekstas');
+  // opts.force — žmogus PATS paspaudė "Konvertuoti į tekstą". Tokiu atveju patikra
+  // praleidžiama: aiškiai išreikštas prašymas visada svarbesnis už mūsų spėjimą, ir
+  // tai yra atsarginis išėjimas, jei slenksčiai kada nors pasirodytų per griežti.
+  if(!(opts&&opts.force)&&await isSilentBlob(blob))throw new Error('Tuščias tekstas');
   // fetch() has no built-in timeout — if the server/network just goes silent (no
   // response, no error), the browser would otherwise wait indefinitely, leaving the
   // spinner stuck forever with no feedback. Force a clear failure after a reasonable
@@ -2759,12 +2845,12 @@ async function doTranscribe(){
     }
     let transcript;
     if(segs&&segs.length){
-      transcript=await transcribeSegments(segs);
+      transcript=await transcribeSegments(segs,null,{force:true}); // v51: rankinis prašymas apeina tylos patikrą
     }else{
       let blob=await idbGetBlob(recId).catch(()=>null);
       if(!blob)blob=await downloadAudioFromStorage(recId,rec.audioPath);
       if(!blob){toast('Garso įrašo nėra šiame įrenginyje.');return;}
-      transcript=await transcribeBlobWithRetry(blob);
+      transcript=await transcribeBlobWithRetry(blob,3,{force:true}); // v51: rankinis prašymas apeina tylos patikrą
     }
     const upd=lang==='lt'?{transcript,transcriptionStatus:'completed',updatedAt:new Date().toISOString()}:{transcriptEn:transcript,updatedAt:new Date().toISOString()};
     await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update(upd);
@@ -3109,7 +3195,23 @@ function hideSplash(){
 function ms2t(ms){const t=Math.floor(ms/1000),h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=t%60;return h>0?h+':'+pad(m)+':'+pad(s):pad(m)+':'+pad(s);}
 function pad(n){return String(n).padStart(2,'0');}
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function toast(msg,ms=2600){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),ms);}
+// v52: rodymo trukmė priklauso nuo teksto ilgio. Anksčiau visi pranešimai dingdavo
+// po 2,6 s — trumpam "Išsaugota ✓" to gana, bet ilgų (pvz. "Įraše nėra teksto —
+// panašu, kad nebuvo kalbėta…") nespėdavai perskaityti. ~12 simbolių per sekundę yra
+// patogus tempas telefone, kai pranešimas pasirodo netikėtai ir jo neskaitai iš anksto
+// žinodamas turinio. Riba iš viršaus — 9 s, kad ilgiausi neužsibūtų ekrane.
+// Aiškiai perduota ms reikšmė turi pirmenybę (šiuo metu tokių kvietimų nėra).
+function toast(msg,ms){
+  const t=document.getElementById('toast');
+  t.textContent=msg;
+  // Aiškiai perduota reikšmė laikoma MINIMUMU: tokie kvietimai kode buvo bandymas
+  // išspręsti būtent šią problemą rankomis, todėl formulė jų nebeturi sutrumpinti.
+  const auto=Math.min(9000,Math.max(2600,2200+String(msg).length*55));
+  const dur=(typeof ms==='number')?Math.max(ms,auto):auto;
+  t.classList.add('show');
+  clearTimeout(t._t);
+  t._t=setTimeout(()=>t.classList.remove('show'),dur);
+}
 
 // ── NETWORK STATUS ──
 // Throws a consistent, recognizable error the moment we know there's no connection,
