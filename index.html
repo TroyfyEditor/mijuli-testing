@@ -709,7 +709,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v50';
+const APP_VERSION='v51';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -2613,9 +2613,66 @@ async function addBookmark(){
 // receives the file through its internal binary handling (stored on disk, not in the
 // sandbox), the Code node is gone entirely, and memory usage no longer depends on file
 // size. Bonus: no base64 step on the phone either — ~25% less data sent.
+// ── v51 (G-4, kliento pusės apsauga) ──────────────────────────────────────────
+// Whisper, gavęs tylų įrašą, "išgirsta" jam kartu perduotą vocabulary sąrašą ir
+// grąžina haliucinaciją (patvirtinta v46 teste: įrašius tylą transkripte atsirado
+// "Dažnų žodžių" reikšmės). Pigiausia apsauga — tokio gabalėlio išvis nesiųsti:
+// dingsta ir haliucinacija, ir API kvietimas, ir laukimas.
+//
+// Sprendimas TYČIA konservatyvus ("fail open"): esant bet kokiai abejonei VISADA
+// siunčiama. Klaidingai palaikius kalbą tyla, prarastume žmogaus žodžius — tai
+// brangiausia įmanoma klaida šioje programoje. Klaidingai išsiuntus tylą, kaina
+// tėra vienas API kvietimas. Todėl dekodavimo klaida, nepalaikomas formatas,
+// per ilgas skaičiavimas ar bet koks netikėtumas reiškia "siųsti".
+const SILENCE_CHECK_ENABLED=true;
+const SILENCE_PEAK_MAX=0.02;  // garsiausias momentas (0..1). Kalba net iš toli pasiekia ~0.05+
+const SILENCE_RMS_MAX=0.005;  // vidutinis lygis. Tyli kalba ~0.01+, tylaus kambario fonas ~0.001
+const SILENCE_CHECK_TIMEOUT_MS=5000;
+async function measureAudioLevel(blob){
+  const OAC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
+  if(!OAC)return null;
+  const ab=await blob.arrayBuffer();
+  // Dekoduojame 8 kHz dažniu: kalbos energijai įvertinti to visiškai pakanka, o
+  // atminties sunaudojama ~6 kartus mažiau nei per įprastus 48 kHz (4 min segmentas
+  // — apie 8 MB vietoje 46 MB, kas telefonui jau būtų juntama).
+  const octx=new OAC(1,1,8000);
+  const buf=await new Promise((res,rej)=>{
+    let settled=false;
+    const ok=b=>{if(!settled){settled=true;res(b);}};
+    const bad=e=>{if(!settled){settled=true;rej(e||new Error('decode failed'));}};
+    // Palaikome abu decodeAudioData variantus (Promise ir senesnį callback).
+    try{const p=octx.decodeAudioData(ab,ok,bad);if(p&&p.then)p.then(ok,bad);}catch(e){bad(e);}
+  });
+  const d=buf.getChannelData(0);
+  let peak=0,sum=0;
+  for(let i=0;i<d.length;i++){const v=d[i]<0?-d[i]:d[i];if(v>peak)peak=v;sum+=d[i]*d[i];}
+  return {peak,rms:Math.sqrt(sum/(d.length||1)),seconds:buf.duration};
+}
+async function isSilentBlob(blob){
+  if(!SILENCE_CHECK_ENABLED||!blob||!blob.size)return false;
+  try{
+    const m=await Promise.race([
+      measureAudioLevel(blob),
+      new Promise(r=>setTimeout(()=>r(null),SILENCE_CHECK_TIMEOUT_MS))
+    ]);
+    if(!m)return false; // neišmatavome — siunčiam
+    const silent=m.peak<SILENCE_PEAK_MAX&&m.rms<SILENCE_RMS_MAX;
+    // Matavimai paliekami konsolėje sąmoningai: pagal juos galima tiksliai suderinti
+    // slenksčius realiais įrašais (žr. v51 aprašą).
+    console.log(`silence check: peak=${m.peak.toFixed(4)} rms=${m.rms.toFixed(4)} trukmė=${m.seconds.toFixed(1)}s → ${silent?'TYLA, nesiunčiama':'siunčiama'}`);
+    return silent;
+  }catch(e){
+    console.warn('silence check nepavyko — siunčiame bet kuriuo atveju:',e);
+    return false;
+  }
+}
 const TRANSCRIBE_WEBHOOK_URL='https://julija.app.n8n.cloud/webhook/b91f4e27-3c6a-4a58-9d2e-64c07a8f15db';
 async function transcribeBlob(blob){
   assertOnline();
+  // v51 (G-4): tylaus gabalėlio nesiunčiame. 'Tuščias tekstas' yra jau visiškai
+  // apdorota baigtis: transcribeBlobWithRetry jos nekartoja, transcribeSegments tokį
+  // segmentą praleidžia, o jei tylūs visi — parodomas įprastas "Įraše nėra teksto".
+  if(await isSilentBlob(blob))throw new Error('Tuščias tekstas');
   // fetch() has no built-in timeout — if the server/network just goes silent (no
   // response, no error), the browser would otherwise wait indefinitely, leaving the
   // spinner stuck forever with no feedback. Force a clear failure after a reasonable
