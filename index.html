@@ -709,7 +709,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v46';
+const APP_VERSION='v47';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1153,7 +1153,7 @@ function goRecord(){
 //      (everything recorded so far is safe), and show a "resume" state instead of
 //      silently recording nothing.
 const IS_IOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
-let wakeLock=null,keepAliveAudio=null,muteTimer=null;
+let wakeLock=null,keepAliveAudio=null,muteTimer=null,muteStartedAt=0;
 async function acquireWakeLock(){
   if(!('wakeLock' in navigator))return; // not supported (older browsers) — other layers still help
   try{
@@ -1165,7 +1165,39 @@ async function acquireWakeLock(){
 }
 function releaseWakeLock(){try{wakeLock&&wakeLock.release();}catch(e){}wakeLock=null;}
 document.addEventListener('visibilitychange',()=>{
-  if(document.visibilityState==='visible'&&(rstate==='recording'||rstate==='paused')&&!wakeLock)acquireWakeLock();
+  // ── v47 (G-1) ────────────────────────────────────────────────────────────────
+  // iOS: perėjus į foną (kita programa arba užrakintas ekranas) sistema sustabdo
+  // AudioContext ir MediaRecorder, O JS TAIMERIAI UŽŠALDOMI. Dėl to track.onmute
+  // debounce taimeris (žr. attachTrackWatch) niekada nespėja suveikti: grįžus
+  // mikrofonas jau vėl aktyvus, todėl arba onunmute panaikina taimerį, arba jis
+  // suveikia su track.muted===false. Rezultatas — rstate lieka 'recording',
+  // resumeAfterInterrupt() nekviečiamas, sustabdyti MediaRecorder ir AudioContext
+  // patys neatsigauna, ir garsas prarandamas TYLIAI (laikmatis tiksi, bangelės
+  // sustingusios, transkripte lieka tik dalis iki perėjimo).
+  //
+  // Todėl pertraukimą fiksuojame ČIA — sinchroniškai, kol JS dar vykdomas prieš
+  // užšaldymą. interruptRec() užsklendžia iki šio momento įrašytą dalį į segmentą,
+  // todėl ji išsaugoma net jei žmogus niekada nebegrįš. Grįžęs jis mato pertraukimo
+  // pranešimą ir ▶ mygtuką, o resumeAfterInterrupt() iš naujo paprašo mikrofono ir
+  // perkuria AudioContext + analyser (todėl atgyja ir bangelės).
+  //
+  // SVARBU: tik iOS. Android'e fone įrašymas veikia teisingai (patikrinta v46
+  // testuose — garsas iš fono laikotarpio patenka į įrašą), todėl ten pertraukimo
+  // fiksuoti NEGALIMA — be reikalo nutrauktume puikiai veikiantį įrašą.
+  if(document.visibilityState==='hidden'){
+    if(IS_IOS&&rstate==='recording')interruptRec();
+    return;
+  }
+  if(document.visibilityState==='visible'){
+    if((rstate==='recording'||rstate==='paused')&&!wakeLock)acquireWakeLock();
+    // Atsarginis sluoksnis (tik iOS): jei 'hidden' įvykis dėl kokios nors priežasties
+    // nebuvo gautas, o mikrofonas grįžus nebegyvas — vis tiek parodome pertraukimo
+    // būseną, o ne tyliai "įrašinėjame" tuštumą.
+    if(IS_IOS&&rstate==='recording'){
+      const t=ms&&ms.getAudioTracks&&ms.getAudioTracks()[0];
+      if(!t||t.readyState!=='live'||t.muted)interruptRec();
+    }
+  }
 });
 function startKeepAliveAudio(){
   if(IS_IOS)return; // iOS gives no priority benefit for this and may pause it anyway
@@ -1186,7 +1218,7 @@ function startRecordingGuards(){
   attachTrackWatch();
   const warn=document.getElementById('rec-warn');
   if(warn&&IS_IOS){
-    warn.textContent='Įrašymo metu užrakinus telefono ekraną ar išjungus programėlę, įrašymas nutraukiamas.';
+    warn.textContent='Įrašymo metu užrakinus telefono ekraną ar išjungus programėlę, įrašymas pristabdomas. Iki tol įrašyta dalis išsaugoma, o grįžę galėsite tęsti paspaudę ▶.';
     warn.style.display='block';
   }
 }
@@ -1207,9 +1239,24 @@ function attachTrackWatch(){
   track.onmute=()=>{
     if(rstate!=='recording')return;
     clearTimeout(muteTimer);
-    muteTimer=setTimeout(()=>{if(rstate==='recording'&&track.muted)interruptRec();},1200);
+    muteStartedAt=Date.now();
+    muteTimer=setTimeout(()=>{
+      if(rstate!=='recording')return;
+      // v47 (G-1): tikriname ne tik track.muted, bet ir REALIAI praėjusį laiką. Jei nuo
+      // nutildymo prabėgo gerokai daugiau nei numatyti 1,2 s, vadinasi puslapis buvo
+      // užšaldytas (foninis režimas) — mikrofonas tuo metu negalėjo įrašinėti, net jei
+      // dabar jis vėl atrodo aktyvus. Be šios patikros toks atvejis lieka nepastebėtas.
+      if(track.muted||Date.now()-muteStartedAt>3000)interruptRec();
+    },1200);
   };
-  track.onunmute=()=>{clearTimeout(muteTimer);muteTimer=null;};
+  track.onunmute=()=>{
+    // v47 (G-1): ilgas nutildymas reiškia foninį užšaldymą, o ne trumpą mirktelėjimą,
+    // dėl kurio buvo įvestas debounce. Tokiu atveju taimerio naikinti negalima —
+    // pertraukimas turi likti užfiksuotas, nes to laikotarpio garso vis tiek nėra.
+    const wasLong=muteTimer&&Date.now()-muteStartedAt>3000;
+    clearTimeout(muteTimer);muteTimer=null;
+    if(wasLong&&rstate==='recording')interruptRec();
+  };
   track.onended=()=>{if(rstate==='recording')interruptRec();};
 }
 function interruptRec(){
@@ -2422,7 +2469,11 @@ function toggleWordHighlight(span){
 function handleTranscriptClick(e){}
 async function addBookmark(){
   if(!ael){toast('Garso įrašas neįkeltas.');return;}
-  const ts=ms2t(ael.currentTime*1000);
+  // v47 (G-3): ael.currentTime yra ŠIO SEGMENTO vidinis laikas, o ilgas įrašas
+  // saugomas 4 min segmentais — todėl grojant ties 09:42 žymė būdavo įrašoma kaip
+  // 01:22 (laikas trečiojo segmento viduje). globalTime() sudeda ankstesnių segmentų
+  // trukmes ir grąžina laiką nuo viso įrašo pradžios.
+  const ts=ms2t(globalTime()*1000);
   const rec=await getRec();if(!rec)return;
   const comments=[...(rec.comments||[]),{text:`📌 Žymė ties ${ts}`,author:nick,createdAt:new Date().toISOString()}];
   await db.collection('users').doc(user.uid).collection('recordings').doc(recId).update({comments});
