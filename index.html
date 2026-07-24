@@ -722,7 +722,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-
 // sw.js faile (const CACHE = 'mijuli-vXX'). Jos privalo sutapti, nes šis numeris
 // rodomas būtent tam, kad telefone būtų galima akimirksniu patikrinti, ar įrenginys
 // tikrai gavo naujausią versiją (o ne rodo seną iš service worker cache).
-const APP_VERSION='v56';
+const APP_VERSION='v57';
 document.querySelectorAll('.js-app-version').forEach(el=>{el.textContent='miJuli '+APP_VERSION;});
 firebase.initializeApp({
   apiKey:"AIzaSyAKESj2SOFZED4qGsz_QSpQWSwsVdmFxJY",
@@ -1010,6 +1010,10 @@ function openPrivacyPolicy(){
     <p>El. paštas, slapyvardis, garso įrašai (saugomi jūsų įrenginyje ir Firebase Storage debesyje), transkriptai, santraukos, komentarai ir užduotys (saugomi Firebase Firestore debesyje).</p>
     <h3>Kam naudojame</h3>
     <p>Tik appso funkcijoms teikti — įrašymui, konvertavimui į tekstą, santraukoms. Duomenų neparduodame ir neperduodame trečiosioms šalims, išskyrus paslaugas, būtinas appso veikimui (Firebase, n8n, OpenAI).</p>
+    <h3>Kiek laiko saugome</h3>
+    <p>Įrašai, transkriptai ir santraukos saugomi tol, kol turite paskyrą. Ištrynus paskyrą Paskyros skiltyje, visi duomenys — garso įrašai, tekstai ir profilis — pašalinami visam laikui.</p>
+    <h3>Kur apdorojami duomenys</h3>
+    <p>Garso įrašai, transkriptai ir santraukos saugomi Firebase (Google) serveriuose Jungtinėse Amerikos Valstijose. AI apdorojimo srautą valdo n8n, kurio serveriai yra Europos Sąjungoje. Konvertavimui į tekstą ir santraukoms garso įrašai ir tekstas perduodami OpenAI, kurios serveriai taip pat yra Jungtinėse Amerikos Valstijose. Šie perdavimai už Europos ekonominės erdvės ribų vyksta pagal Europos Komisijos patvirtintas standartines sutarčių sąlygas, kurias Google ir OpenAI taiko savo paslaugų teikimo sąlygose. OpenAI perduotų duomenų nenaudoja savo modeliams mokyti, tačiau iki 30 dienų saugo juos piktnaudžiavimo stebėsenos tikslais.</p>
     <h3>Šiukšliadėžė</h3>
     <p>Ištrinti įrašai 7 dienas laikomi šiukšliadėžėje ir gali būti atkurti. Po 7 dienų jie ištrinami visam laikui.</p>
     <h3>Jūsų teisės</h3>
@@ -1320,15 +1324,26 @@ document.addEventListener('visibilitychange',()=>{
       // užmigdymo pradžioje (perėjimo momentu) pakakdavo, kad spraga liktų nepastebėta.
       const noSignal=Date.now()-lastSignalTs>3000,frozen=ticks<3;
       if(bgMs>3000&&(noSignal||frozen)){
-        // Android'e įrašymas po grįžimo paprastai veikia toliau — nutraukti jį ir versti
-        // spausti ▶ būtų blogiau nei pasakyti tiesą. Todėl PRANEŠAMA, bet neužstabdoma.
-        toast('Programa buvo fone — tuo metu telefonas garso neįrašė. Įrašymas tęsiamas toliau.');
+        // v57: pranešimas nebežada, kad įrašymas tęsiasi. Nuo v56 išėjus iš programos
+        // pristabdoma VISADA, todėl šis blokas pasiekiamas tik tuo atveju, kai 'hidden'
+        // šakos interruptRec() dėl kokios nors priežasties nesuveikė. Tokioje būsenoje
+        // yra dvi galimos baigtys: arba mikrofonas atgyja ir įrašymas iš tikrųjų
+        // tęsiasi, arba po 1,8 s žemiau esantis taimeris fiksuoja pertraukimą. Senas
+        // tekstas žadėjo pirmąją ir antruoju atveju melavo. Naujas teisingas abiem.
+        toast('Programa buvo fone — tuo metu telefonas garso neįrašė. Iki tol įrašyta dalis išsaugota.');
         // Bet jei mikrofonas ir grįžus liko negyvas, tęsti nėra ko: palaukiame, ar
         // signalas atsinaujina, ir tik tada fiksuojame tikrą pertraukimą.
         const mark=Date.now();
         clearTimeout(bgWarnTimer);
+        // v57: kartu su pertraukimu parodomas ir pranešimas. interruptRec() pakeičia tik
+        // pilką užrašą po mygtuku, o v56 grįžimo toast'as ('pendingResumeNotice') šiuo
+        // momentu jau būna suvartotas — tad be šito žmogus apie pristabdymą sužinotų tik
+        // iš to paties pilko teksto, kurį v56 komentaras pats vadina lengvai pražiūrimu.
         bgWarnTimer=setTimeout(()=>{
-          if(rstate==='recording'&&lastSignalTs<mark)interruptRec();
+          if(rstate==='recording'&&lastSignalTs<mark){
+            interruptRec();
+            toast('Įrašymas pristabdytas — mikrofonas neatsigavo. Palieskite ▶, kad tęstumėte.');
+          }
         },1800);
       }
     }
